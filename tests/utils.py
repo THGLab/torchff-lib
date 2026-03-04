@@ -15,7 +15,7 @@ def check_op(
         prb.backward()
         for k, v in args.items():
             if torch.is_tensor(v) and v.grad is not None:
-                prb_grads[k] = v
+                prb_grads[k] = v.grad.clone()
                 v.grad.zero_()
     
     ref = ref_func(**args)
@@ -24,17 +24,17 @@ def check_op(
         ref.backward()
         for k, v in args.items():
             if torch.is_tensor(v) and v.grad is not None:
-                ref_grads[k] = v
+                ref_grads[k] = v.grad.clone()
                 v.grad.zero_()
     
     if verbose:
         print(f"Ref: {ref} vs Prb: {prb}")
-    assert torch.allclose(ref, prb, atol=atol, rtol=rtol), f"Function value not the same: {ref.cpu().item():.5f} != {prb.cpu().item()}"
+    assert torch.allclose(ref, prb, atol=atol, rtol=rtol), f"Function value not the same: {ref.cpu().item():.5f}(ref) != {prb.cpu().item()}(prb)"
     if check_grad:
         for arg_name in prb_grads:
             ref_grad, prb_grad = ref_grads[arg_name], prb_grads[arg_name]
             if verbose:
-                print(arg_name, ref_grad, prb_grad)
+                print(arg_name, ref_grad[0], prb_grad[0])
             assert torch.allclose(ref_grad, prb_grad, atol=atol, rtol=rtol), arg_name + f'gradient not the same for {arg_name}, max deviation {torch.max(torch.abs(ref_grad - prb_grad))}, Ref: {ref_grad}, Prb: {prb_grad}'
 
 
