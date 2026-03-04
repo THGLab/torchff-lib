@@ -129,12 +129,7 @@ class MultipolePacker(nn.Module):
     def __init__(self, rank: int = 2):
         super().__init__()
         self.rank = rank
-        if self.rank > 1:
-            self.register_buffer(
-                "scale",
-                torch.tensor([1 / 3, 2 / 3, 2 / 3, 1 / 3, 2 / 3, 1 / 3]),
-            )
-
+        
     def forward(
         self,
         mono: torch.Tensor,
@@ -164,7 +159,12 @@ class MultipolePacker(nn.Module):
             return torch.hstack((
                 mono.unsqueeze(1),
                 dipo,
-                quad[:, [0, 0, 0, 1, 1, 2], [0, 1, 2, 1, 2, 2]] * self.scale
+                quad[:, 0, 0].unsqueeze(1) / 3,
+                (quad[:, 0, 1] + quad[:, 1, 0]).unsqueeze(1) / 3,
+                (quad[:, 0, 2] + quad[:, 2, 0]).unsqueeze(1) / 3,
+                quad[:, 1, 1].unsqueeze(1) / 3,
+                (quad[:, 1, 2] + quad[:, 2, 1]).unsqueeze(1) / 3,
+                quad[:, 2, 2].unsqueeze(1) / 3,
             ))
 
 

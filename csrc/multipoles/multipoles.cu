@@ -77,17 +77,17 @@ __global__ void multipolar_interaction_atom_pairs_kernel(
 
         if constexpr (RANK >= 2) {
             mpi.qxx = t[i * 9 + 0] * scalar_t(1/3.0);
-            mpi.qxy = t[i * 9 + 1] * scalar_t(2/3.0);
-            mpi.qxz = t[i * 9 + 2] * scalar_t(2/3.0);
+            mpi.qxy = (t[i * 9 + 1] + t[i * 9 + 3]) * scalar_t(1/3.0);
+            mpi.qxz = (t[i * 9 + 2] + t[i * 9 + 6]) * scalar_t(1/3.0);
             mpi.qyy = t[i * 9 + 4] * scalar_t(1/3.0);
-            mpi.qyz = t[i * 9 + 5] * scalar_t(2/3.0);
+            mpi.qyz = (t[i * 9 + 5] + t[i * 9 + 7]) * scalar_t(1/3.0);
             mpi.qzz = t[i * 9 + 8] * scalar_t(1/3.0);
 
             mpj.qxx = t[j * 9 + 0] * scalar_t(1/3.0);
-            mpj.qxy = t[j * 9 + 1] * scalar_t(2/3.0);
-            mpj.qxz = t[j * 9 + 2] * scalar_t(2/3.0);
+            mpj.qxy = (t[j * 9 + 1] + t[j * 9 + 3]) * scalar_t(1/3.0);
+            mpj.qxz = (t[j * 9 + 2] + t[j * 9 + 6]) * scalar_t(1/3.0);
             mpj.qyy = t[j * 9 + 4] * scalar_t(1/3.0);
-            mpj.qyz = t[j * 9 + 5] * scalar_t(2/3.0);
+            mpj.qyz = (t[j * 9 + 5] + t[j * 9 + 7]) * scalar_t(1/3.0);
             mpj.qzz = t[j * 9 + 8] * scalar_t(1/3.0);
         }
 
@@ -144,23 +144,23 @@ __global__ void multipolar_interaction_atom_pairs_kernel(
         if constexpr (RANK >= 2) {
             if (t_grad) {
                 atomicAdd(&t_grad[i * 9 + 0], mpi.egxx * scalar_t(1/3.0) * prefactor);
-                atomicAdd(&t_grad[i * 9 + 1], mpi.egxy * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[i * 9 + 2], mpi.egxz * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[i * 9 + 3], mpi.egxy * scalar_t(2/3.0) * prefactor);
+                atomicAdd(&t_grad[i * 9 + 1], mpi.egxy * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[i * 9 + 2], mpi.egxz * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[i * 9 + 3], mpi.egxy * scalar_t(1/3.0) * prefactor);
                 atomicAdd(&t_grad[i * 9 + 4], mpi.egyy * scalar_t(1/3.0) * prefactor);
-                atomicAdd(&t_grad[i * 9 + 5], mpi.egyz * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[i * 9 + 6], mpi.egxz * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[i * 9 + 7], mpi.egyz * scalar_t(2/3.0) * prefactor);
+                atomicAdd(&t_grad[i * 9 + 5], mpi.egyz * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[i * 9 + 6], mpi.egxz * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[i * 9 + 7], mpi.egyz * scalar_t(1/3.0) * prefactor);
                 atomicAdd(&t_grad[i * 9 + 8], mpi.egzz * scalar_t(1/3.0) * prefactor);
 
                 atomicAdd(&t_grad[j * 9 + 0], mpj.egxx * scalar_t(1/3.0) * prefactor);
-                atomicAdd(&t_grad[j * 9 + 1], mpj.egxy * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[j * 9 + 2], mpj.egxz * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[j * 9 + 3], mpj.egxy * scalar_t(2/3.0) * prefactor);
+                atomicAdd(&t_grad[j * 9 + 1], mpj.egxy * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[j * 9 + 2], mpj.egxz * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[j * 9 + 3], mpj.egxy * scalar_t(1/3.0) * prefactor);
                 atomicAdd(&t_grad[j * 9 + 4], mpj.egyy * scalar_t(1/3.0) * prefactor);
-                atomicAdd(&t_grad[j * 9 + 5], mpj.egyz * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[j * 9 + 6], mpj.egxz * scalar_t(2/3.0) * prefactor);
-                atomicAdd(&t_grad[j * 9 + 7], mpj.egyz * scalar_t(2/3.0) * prefactor);
+                atomicAdd(&t_grad[j * 9 + 5], mpj.egyz * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[j * 9 + 6], mpj.egxz * scalar_t(1/3.0) * prefactor);
+                atomicAdd(&t_grad[j * 9 + 7], mpj.egyz * scalar_t(1/3.0) * prefactor);
                 atomicAdd(&t_grad[j * 9 + 8], mpj.egzz * scalar_t(1/3.0) * prefactor);
             }
         }
