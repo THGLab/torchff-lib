@@ -111,3 +111,71 @@ __global__ void compute_self_contribution_kernel_rank_2(
     // reduce sum
     block_reduce_sum<T, BLOCK_SIZE>(e, energy);
 }
+
+template <typename T, int BLOCK_SIZE = 256, int RANK>
+__global__ void compute_self_contribution_forward_kernel(
+    const T* __restrict__ q,
+    const T* __restrict__ p,
+    const T* __restrict__ t,
+    int64_t N,
+    const T alpha,
+    T* __restrict__ energy,
+    T* __restrict__ epot,
+    T* __restrict__ efield,
+    T* __restrict__ efield_grad
+) {
+    static_assert(RANK >= 0 && RANK <= 2, "RANK must be 0, 1, or 2");
+
+    constexpr T INV_ROOT_PI = inv_root_pi<T>();
+    const T a_over_rpi = alpha * INV_ROOT_PI;
+
+    T pref_fld = 0, pref_fg = 0;
+    if constexpr (RANK >= 1) {
+        const T alpha2 = alpha * alpha;
+        pref_fld = a_over_rpi * (T(4.0) * alpha2 / T(3.0));
+        if constexpr (RANK >= 2) {
+            pref_fg = a_over_rpi * (T(16.0) * alpha2 * alpha2 / T(15.0));
+        }
+    }
+
+    T e = 0;
+    for (int index = threadIdx.x + blockIdx.x * BLOCK_SIZE; index < N; index += BLOCK_SIZE * gridDim.x) {
+        const T qi = q[index];
+        e -= a_over_rpi * qi * qi;
+        if (epot) epot[index] -= a_over_rpi * qi * T(2.0);
+
+        if constexpr (RANK >= 1) {
+            const T px = p[3 * index + 0];
+            const T py = p[3 * index + 1];
+            const T pz = p[3 * index + 2];
+            e -= pref_fld * (px * px + py * py + pz * pz) / T(2.0);
+            if (efield) {
+                efield[3 * index + 0] += pref_fld * px;
+                efield[3 * index + 1] += pref_fld * py;
+                efield[3 * index + 2] += pref_fld * pz;
+            }
+        }
+
+        if constexpr (RANK >= 2) {
+            const T* ti = &t[9 * index];
+            const T txx = ti[0], txy = ti[1], txz = ti[2];
+            const T tyx = ti[3], tyy = ti[4], tyz = ti[5];
+            const T tzx = ti[6], tzy = ti[7], tzz = ti[8];
+            e -= pref_fg * (txx * txx + txy * txy + txz * txz +
+                            tyx * tyx + tyy * tyy + tyz * tyz +
+                            tzx * tzx + tzy * tzy + tzz * tzz) / T(6.0);
+            if (efield_grad) {
+                efield_grad[9 * index + 0] += pref_fg * txx;
+                efield_grad[9 * index + 1] += pref_fg * txy;
+                efield_grad[9 * index + 2] += pref_fg * txz;
+                efield_grad[9 * index + 3] += pref_fg * tyx;
+                efield_grad[9 * index + 4] += pref_fg * tyy;
+                efield_grad[9 * index + 5] += pref_fg * tyz;
+                efield_grad[9 * index + 6] += pref_fg * tzx;
+                efield_grad[9 * index + 7] += pref_fg * tzy;
+                efield_grad[9 * index + 8] += pref_fg * tzz;
+            }
+        }
+    }
+    if (energy) block_reduce_sum<T, BLOCK_SIZE>(e, energy);
+}
