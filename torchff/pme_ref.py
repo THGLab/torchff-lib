@@ -229,7 +229,7 @@ def spread_Q(N, positions, box, Q_dict, n_mesh, rank):
 
         quad_term = term_diag + term_off
 
-        scale = 0.5
+        scale = 1/3
         W_tot += scale * quad_term
 
     # Scatter to grid
@@ -281,6 +281,7 @@ def get_pme_recip(Ck_fn, kappa,positions,box,Q_dict,K1,K2,K3,rank, bspline_order
     #Energy straight from grid. Useful for debugging
     #E_k = 0.5 * torch.sum(C_k * torch.abs(S_k[1:] / theta_k[1:])**2) 
     #print(f"CARTESIAN PME ENERGY FROM STRUCTURE FACTOR: {E_k}")
+    # print(torch.sum(Phi_real_space*Q_mesh)/2)
 
     # Interpolate Back
     long_range_potential, long_range_field, long_range_field_gradient = interpolate_to_atoms(
@@ -412,7 +413,7 @@ def interpolate_to_atoms(phi_grid: torch.Tensor,
         hess_phi_u = torch.sum(phi_loc.reshape(Na, n_mesh, 1, 1) * hess_W_u, dim=1) # (Na, 3, 3)
         # Transform to Real Space: Hess_r = M * Hess_u * M.T
         # Einstein: H_r_ij = M_im * H_u_mn * M_jn
-        grad_E = torch.einsum('mi,knm,nj->kij', M_mat, hess_phi_u, M_mat) / 2.0
+        grad_E = torch.einsum('mi,knm,nj->kij', M_mat, hess_phi_u, M_mat)
         EG_atoms = -grad_E
 
     return phi_atoms, E_atoms, EG_atoms

@@ -10,12 +10,13 @@ except ImportError:
     pass
 
 class PME(nn.Module):
-    def __init__(self, alpha: float, max_hkl: int, rank: int, use_customized_ops: bool = False):
+    def __init__(self, alpha: float, max_hkl: int, rank: int, use_customized_ops: bool = False, return_fields: bool = False):
         super().__init__()
         self.alpha = float(alpha)
         self.max_hkl = int(max_hkl)
         self.rank = int(rank)
         self.use_customized_ops = use_customized_ops
+        self.return_fields = return_fields
         if use_customized_ops:
             K = self.max_hkl
             xmoduli = bsplines.compute_bspline_moduli_1d(K, dtype=torch.float32)
@@ -42,42 +43,48 @@ class PME(nn.Module):
             # xx, xy, xz, yy, yz, zz
             return torch.stack([
                 t[:, 0, 0],  # Qxx
-                t[:, 0, 1],  # Qxy
-                t[:, 0, 2],  # Qxz
+                (t[:, 0, 1] + t[:, 1, 0]) / 2,  # Qxy
+                (t[:, 0, 2] + t[:, 2, 0]) / 2,  # Qxz
                 t[:, 1, 1],  # Qyy
-                t[:, 1, 2],  # Qyz
+                (t[:, 1, 2] + t[:, 2, 1]) / 2,  # Qyz
                 t[:, 2, 2]   # Qzz
             ], dim=1)
             
         # If t is flattened (N, 9), extract indices
         if t.ndim == 2 and t.shape[-1] == 9:
              return torch.stack([
-                t[:, 0], t[:, 1], t[:, 2],
-                t[:, 4], t[:, 5], t[:, 8]
+                t[:, 0], 
+                (t[:, 1] + t[:, 3]) / 2, 
+                (t[:, 2] + t[:, 6]) / 2,
+                t[:, 4], 
+                (t[:, 5] + t[:, 7]) / 2, 
+                t[:, 8]
              ], dim=1)
              
         raise ValueError(f"Quadrupole tensor t has unexpected shape: {t.shape}")
 
     def forward(self, coords: torch.Tensor, box: torch.Tensor, q: torch.Tensor, p: Optional[torch.Tensor] = None, t: Optional[torch.Tensor] = None):
         # 1. Pre-process Quadrupoles for both C++ and Python paths
-        t_packed = t
-        if self.rank >= 2 and t is not None:
-            t_packed = self._pack_quadrupoles(t)
         if self.use_customized_ops:
-            return self._forward_cpp(coords, box, q, p, t_packed)
+            return self._forward_cpp(coords, box, q, p, t)
         else:
-            return self._forward_python(coords, box, q, p, t_packed)
+            if self.rank >= 2 and t is not None:
+                t = self._pack_quadrupoles(t)
+            return self._forward_python(coords, box, q, p, t)
 
     def _forward_cpp(self, coords, box, q, p, t_packed):
-        # Returns: (phi, E, EG, energy, forces)
-        # We pass the packed (N, 6) tensor here.
-        # The C++ extension will return gradients for t_packed (N, 6).
-        # PyTorch will automatically map those gradients back to the original (N, 3, 3) t input.
-        return torch.ops.torchff.pme_long_range(
-            coords, box, q, p, t_packed,
-            self.max_hkl, self.rank, self.alpha,
-            self.xmoduli, self.ymoduli, self.zmoduli
-        )
+        if not self.return_fields:
+            return torch.ops.torchff.pme_long_range(
+                coords, box, q, p, t_packed,
+                self.max_hkl, self.alpha,
+                self.xmoduli, self.ymoduli, self.zmoduli
+            )
+        else:
+            return torch.ops.torchff.pme_long_range_all(
+                coords, box, q, p, t_packed,
+                self.max_hkl, self.alpha,
+                self.xmoduli, self.ymoduli, self.zmoduli
+            )
 
     def _forward_python(self, coords, box, q, p, t_packed):
         # 1. Compute PME terms
@@ -85,7 +92,7 @@ class PME(nn.Module):
         
         # 2. Unpack results based on rank
         pot = ret if self.rank == 0 else ret[0]
-        field = ret[1] if self.rank >= 1 else torch.zeros_like(p)
+        field = ret[1] if self.rank >= 1 else torch.zeros((coords.shape[0], 3), device=coords.device, dtype=coords.dtype)
         EG = ret[2] if self.rank >= 2 else (torch.zeros_like(t_packed) if t_packed is not None else None)
         # 3. Calculate Energy Terms
         term_q = 0.5 * torch.sum(q * pot)
@@ -111,6 +118,8 @@ class PME(nn.Module):
                 2.0 * (t_packed[:, 1] * eg_xy + t_packed[:, 2] * eg_xz + t_packed[:, 4] * eg_yz)
             )
 
-            term_t = -(1.0/2.0) * torch.sum(contraction)
+            term_t = -(1.0/6.0) * torch.sum(contraction)
         energy = term_q + term_p + term_t
-        return pot, field, EG, energy
+        if not self.return_fields:
+            return energy
+        return energy, pot, field
