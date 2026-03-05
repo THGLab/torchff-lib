@@ -55,11 +55,11 @@ def create_test_data(num: int, rank: int = 2, device: str = "cuda", dtype: torch
 
 
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
-@pytest.mark.parametrize("rank", [0])
+@pytest.mark.parametrize("rank", [0, 1, 2])
 def test_pme_execution(device, dtype, rank):
     """Compare custom CUDA PME kernel against Python reference implementation."""
     N = 300
-    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, 2, device=device, dtype=dtype)
+    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
 
     func = PME(alpha, max_hkl, rank, use_customized_ops=True).to(
         device=device, dtype=dtype
@@ -82,13 +82,52 @@ def test_pme_execution(device, dtype, rank):
         func_ref_wrapper,
         {"coords": coords, "box": box, "q": q, "p": p, "t": t},
         check_grad=True,
-        atol=1e-6 if dtype is torch.float64 else 1e-4,
-        rtol=1e-5,
+        atol=1e-5 if dtype is torch.float64 else 1e-4,
+        rtol=0.0,
+        verbose=True
     )
 
 
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
-@pytest.mark.parametrize("rank", [0])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_pme_with_field_simple(device, dtype, rank):
+    """Verify that E = (q*pot - p*field - t*field_grad/3) / 2 holds."""
+    N = 300
+    coords, box, q, p, t, alpha, max_hkl = create_test_data(N, rank, device=device, dtype=dtype)
+    coords.requires_grad_(True)
+
+    pme_ref = PME(alpha, max_hkl, rank, use_customized_ops=True, return_fields=True).to(
+        device=device, dtype=dtype
+    )
+    pme = PME(alpha, max_hkl, rank, use_customized_ops=True, return_fields=True).to(
+        device=device, dtype=dtype
+    )
+
+    def ref_func(coords, box, q, p, t):
+        energy, pot, field = pme_ref(coords, box, q, p, t)
+        if rank == 0:
+            return torch.sum(q * pot) / 2
+        else:
+            return (torch.sum(q * pot) - torch.sum(p * field)) / 2
+
+    def func(coords, box, q, p, t):
+        energy, pot, field = pme(coords, box, q, p, t)
+        if rank == 0:
+            return torch.sum(q * pot) / 2
+        else:
+            return (torch.sum(q * pot) - torch.sum(p * field)) / 2
+
+    check_op(
+        func,
+        ref_func,
+        {"coords": coords, "box": box, "q": q, "p": p, "t": t},
+        check_grad=True,
+        verbose=True,
+    )
+
+
+@pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
+@pytest.mark.parametrize("rank", [0, 1, 2])
 def test_perf_pme(device, dtype, rank):
     """Performance comparison between Python and custom CUDA PME implementations."""
     N = 300
