@@ -48,6 +48,11 @@ template <typename scalar_t> __device__ __forceinline__ scalar_t floor_(scalar_t
 template<> __device__ __forceinline__ float floor_(float x) { return ::floorf(x); };
 template<> __device__ __forceinline__ double floor_(double x) { return ::floor(x); };
 
+// ceil
+template <typename scalar_t> __device__ __forceinline__ scalar_t ceil_(scalar_t x) {};
+template<> __device__ __forceinline__ float ceil_(float x) { return ::ceilf(x); };
+template<> __device__ __forceinline__ double ceil_(double x) { return ::ceil(x); };
+
 // rsqrt
 template <typename scalar_t> __device__ __forceinline__ scalar_t rsqrt_(scalar_t x) {};
 template<> __device__ __forceinline__ float rsqrt_(float x) { return ::rsqrtf(x); };
@@ -102,7 +107,7 @@ __device__ __forceinline__ void cross_vec3(scalar_t* a, scalar_t* b, scalar_t* o
 }
 
 template <typename scalar_t>
-__device__ __forceinline__ void diff_vec3(scalar_t* a, scalar_t* b, scalar_t* out) {
+__device__ __forceinline__ void diff_vec3(const scalar_t* a, const scalar_t* b, scalar_t* out) {
     out[0] = a[0] - b[0];
     out[1] = a[1] - b[1];
     out[2] = a[2] - b[2];
@@ -119,7 +124,7 @@ __device__ __forceinline__ scalar_t norm_vec3(scalar_t* a) {
 }
 
 template <typename scalar_t>
-__device__ __forceinline__ scalar_t normalize_vec3(scalar_t* a, scalar_t* out) {
+__device__ __forceinline__ void normalize_vec3(scalar_t* a, scalar_t* out) {
     scalar_t rnorm = rnorm3d_(a[0], a[1], a[2]);
     out[0] = a[0] * rnorm;
     out[1] = a[1] * rnorm;

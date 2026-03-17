@@ -4,7 +4,7 @@
 #include "vec3.cuh"
 
 template <typename scalar_t>
-__device__ __forceinline__ void apply_pbc_triclinic(scalar_t* vec, scalar_t* box, scalar_t* box_inv, scalar_t* out) {
+__device__ __forceinline__ void apply_pbc_triclinic(const scalar_t* vec, const scalar_t* box, const scalar_t* box_inv, scalar_t* out) {
     // box in row major
     scalar_t sa = vec[0] * box_inv[0] + vec[1] * box_inv[3] + vec[2] * box_inv[6];
     scalar_t sb = vec[0] * box_inv[1] + vec[1] * box_inv[4] + vec[2] * box_inv[7];
