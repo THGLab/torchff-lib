@@ -26,9 +26,9 @@ enum AxisType {
 template <typename scalar_t>
 __global__ void compute_rotation_matrices_forward_kernel(
     scalar_t* coords,
-    int32_t* zatoms, int32_t* xatoms, int32_t* yatoms,
-    int32_t* axistypes,
-    int32_t natoms,
+    int64_t* zatoms, int64_t* xatoms, int64_t* yatoms,
+    int64_t* axistypes,
+    int64_t natoms,
     scalar_t* rot_matrices
 )
 {
@@ -36,9 +36,9 @@ __global__ void compute_rotation_matrices_forward_kernel(
     constexpr scalar_t ZERO = scalar_t(0.0);
     constexpr scalar_t THRESH = scalar_t(0.866);
 
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < natoms; index += gridDim.x * blockDim.x) {
-        int32_t type = axistypes[index];
+    int64_t start = threadIdx.x + blockDim.x * blockIdx.x;
+    for (int64_t index = start; index < natoms; index += gridDim.x * blockDim.x) {
+        int64_t type = axistypes[index];
 
         scalar_t xvec[3] = {};
         scalar_t zvec[3] = {};
@@ -51,18 +51,18 @@ __global__ void compute_rotation_matrices_forward_kernel(
             ri[0] = coords[index*3]; ri[1] = coords[index*3+1]; ri[2] = coords[index*3+2];
 
             /* zatom */
-            int32_t z = zatoms[index];
+            int64_t z = zatoms[index];
             if ( z >= 0 ) {
                 diff_vec3(&coords[z*3], ri, zvec);
                 normalize_vec3(zvec, zvec);
             }
             /* xatom */
-            int32_t x = xatoms[index];
+            int64_t x = xatoms[index];
             if ( x >= 0 ) {
                 diff_vec3(&coords[x*3], ri, xvec);
             }
             /* yatom */
-            int32_t y = yatoms[index]; 
+            int64_t y = yatoms[index]; 
             if ( y >= 0 ) {
                 diff_vec3(&coords[y*3], ri, yvec);
             }
@@ -123,9 +123,9 @@ __global__ void compute_rotation_matrices_forward_kernel(
 template <typename scalar_t>
 __global__ void compute_rotation_matrices_backward_kernel(
     scalar_t* coords,
-    int32_t* zatoms, int32_t* xatoms, int32_t* yatoms,
-    int32_t* axistypes,
-    int32_t natoms,
+    int64_t* zatoms, int64_t* xatoms, int64_t* yatoms,
+    int64_t* axistypes,
+    int64_t natoms,
     scalar_t* rot_matrices_grad,
     scalar_t* coords_grad
 )
@@ -135,10 +135,10 @@ __global__ void compute_rotation_matrices_backward_kernel(
     constexpr scalar_t ZERO = scalar_t(0.0);
     constexpr scalar_t THRESH = scalar_t(0.866);
 
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < natoms; index += gridDim.x * blockDim.x) {
+    int64_t start = threadIdx.x + blockDim.x * blockIdx.x;
+    for (int64_t index = start; index < natoms; index += gridDim.x * blockDim.x) {
 
-        int32_t type = axistypes[index];
+        int64_t type = axistypes[index];
         if ( type == NoAxisType ) {
             continue;
         }
@@ -147,7 +147,7 @@ __global__ void compute_rotation_matrices_backward_kernel(
         scalar_t ri[3];
         ri[0] = coords[index*3]; ri[1] = coords[index*3+1]; ri[2] = coords[index*3+2];
         /* z atom */
-        int32_t z = zatoms[index];
+        int64_t z = zatoms[index];
         scalar_t rzi_norm_inv = ZERO;
         scalar_t rzi[3] = {};
         if ( z >= 0 ) {
@@ -155,7 +155,7 @@ __global__ void compute_rotation_matrices_backward_kernel(
             rzi_norm_inv = rnorm3d_(rzi[0], rzi[1], rzi[2]);
         }
         /* x atom */
-        int32_t x = xatoms[index];
+        int64_t x = xatoms[index];
         scalar_t rxi_norm_inv = ZERO;
         scalar_t rxi[3] = {};
         if ( x >= 0 ) {
@@ -163,7 +163,7 @@ __global__ void compute_rotation_matrices_backward_kernel(
             rxi_norm_inv = rnorm3d_(rxi[0], rxi[1], rxi[2]);
         }
         /* y atom */
-        int32_t y = yatoms[index];
+        int64_t y = yatoms[index];
         scalar_t ryi_norm_inv = ZERO;
         scalar_t ryi[3] = {};
         if ( y >= 0 ) {
@@ -362,32 +362,32 @@ static at::Tensor forward(
     at::Tensor& axistypes
 )
 {
-    int32_t natoms = coords.size(0);
+    int64_t natoms = coords.size(0);
     
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
     
-    int32_t block_dim = 256;
-    int32_t grid_dim = std::min(
-        (natoms + block_dim - 1) / block_dim,
+    constexpr int BLOCK_SIZE = 256;
+    int GRID_SIZE = std::min(
+        static_cast<int>((natoms + BLOCK_SIZE - 1) / BLOCK_SIZE),
         props->multiProcessorCount*props->maxBlocksPerMultiProcessor
     );
 
     at::Tensor rot_matrices = at::zeros({natoms, 3, 3}, coords.options());
 
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_rotation_matrices_forward_kernel", ([&] {
-        compute_rotation_matrices_forward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        compute_rotation_matrices_forward_kernel<scalar_t><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
-            zatoms.data_ptr<int32_t>(), xatoms.data_ptr<int32_t>(), yatoms.data_ptr<int32_t>(),
-            axistypes.data_ptr<int32_t>(),
+            zatoms.data_ptr<int64_t>(), xatoms.data_ptr<int64_t>(), yatoms.data_ptr<int64_t>(),
+            axistypes.data_ptr<int64_t>(),
             natoms,
             rot_matrices.data_ptr<scalar_t>()
         );
     }));
     ctx->save_for_backward({coords, zatoms, xatoms, yatoms, axistypes});
     ctx->saved_data["natoms"] = natoms;
-    ctx->saved_data["block_dim"] = block_dim;
-    ctx->saved_data["grid_dim"] = grid_dim;
+    ctx->saved_data["block_dim"] = BLOCK_SIZE;
+    ctx->saved_data["grid_dim"] = GRID_SIZE;
     return rot_matrices;
 }
 
@@ -398,17 +398,17 @@ static std::vector<at::Tensor> backward(
 {
     auto saved = ctx->get_saved_variables();
     at::Tensor coords_grad = at::zeros_like(saved[0], saved[0].options());
-    int32_t natoms = static_cast<int32_t>(ctx->saved_data["natoms"].toInt());
-    int32_t block_dim = static_cast<int32_t>(ctx->saved_data["block_dim"].toInt());
-    int32_t grid_dim = static_cast<int32_t>(ctx->saved_data["grid_dim"].toInt());
+    int64_t natoms = static_cast<int64_t>(ctx->saved_data["natoms"].toInt());
+    int64_t block_dim = static_cast<int64_t>(ctx->saved_data["block_dim"].toInt());
+    int64_t grid_dim = static_cast<int64_t>(ctx->saved_data["grid_dim"].toInt());
     auto stream = at::cuda::getCurrentCUDAStream();
     
 
     AT_DISPATCH_FLOATING_TYPES(saved[0].scalar_type(), "compute_rotation_matrices_backward_kernel", ([&] {
         compute_rotation_matrices_backward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
             saved[0].data_ptr<scalar_t>(),
-            saved[1].data_ptr<int32_t>(), saved[2].data_ptr<int32_t>(), saved[3].data_ptr<int32_t>(),
-            saved[4].data_ptr<int32_t>(),
+            saved[1].data_ptr<int64_t>(), saved[2].data_ptr<int64_t>(), saved[3].data_ptr<int64_t>(),
+            saved[4].data_ptr<int64_t>(),
             natoms,
             grad_outputs[0].contiguous().data_ptr<scalar_t>(),
             coords_grad.data_ptr<scalar_t>()
