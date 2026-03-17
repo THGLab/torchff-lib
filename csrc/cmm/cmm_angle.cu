@@ -9,11 +9,12 @@
 #include <cuda_runtime.h>
 
 #include "common/vec3.cuh"
+#include "common/reduce.cuh"
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_angles_forward_kernel(
     scalar_t* coords,
-    int32_t* angles,
+    int64_t* angles,
     scalar_t* theta_0,
     scalar_t* k_theta,
     scalar_t* r_eq_1,
@@ -24,17 +25,24 @@ __global__ void cmm_angles_forward_kernel(
     scalar_t* j_cf_bb,
     scalar_t* j_cf_angle,
     scalar_t ene_coupling_min,
-    int32_t nangles,
-    scalar_t* ene,
+    int64_t nangles,
+    scalar_t* ene_out,
     scalar_t* dq_a,
     scalar_t* coords_grad
 )
 {
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < nangles; index += gridDim.x * blockDim.x) {
-        int32_t i = angles[index*3];
-        int32_t j = angles[index*3+1];
-        int32_t k = angles[index*3+2];
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        ene_out[0] = scalar_t(0.0);
+    }
+    __syncthreads();
+
+    scalar_t ene = scalar_t(0.0);
+
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < nangles; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = angles[index*3];
+        int64_t j = angles[index*3+1];
+        int64_t k = angles[index*3+2];
 
         scalar_t kth = k_theta[index];
         scalar_t kbb = k_bb[index];
@@ -136,7 +144,7 @@ __global__ void cmm_angles_forward_kernel(
         dqi += jcf * (rkj - req2);
         dqk += jcf * (rij - req1);
 
-        ene[index] = e;
+        ene += e;
         atomicAdd(&dq_a[i], dqi);
         atomicAdd(&dq_a[k], dqk);
         atomicAdd(&dq_a[j], -dqi-dqk);
@@ -153,27 +161,29 @@ __global__ void cmm_angles_forward_kernel(
         atomicAdd(&coords_grad[j*3+1], -dri_y-drk_y);
         atomicAdd(&coords_grad[j*3+2], -dri_z-drk_z);
     }
+
+    block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
 }
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_angles_backward_kernel(
     scalar_t* coords,
-    int32_t* angles,
+    int64_t* angles,
     scalar_t* r_eq_1,
     scalar_t* r_eq_2,
     scalar_t* j_cf_angle,
     scalar_t* j_cf_bb,
-    int32_t nangles,
+    int64_t nangles,
     scalar_t* dq_a_grad,
     scalar_t* coords_grad
 )
 {
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < nangles; index += gridDim.x * blockDim.x) {
-        int32_t i = angles[index*3];
-        int32_t j = angles[index*3+1];
-        int32_t k = angles[index*3+2];
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < nangles; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = angles[index*3];
+        int64_t j = angles[index*3+1];
+        int64_t k = angles[index*3+2];
 
         scalar_t rij_x = coords[i*3] - coords[j*3];
         scalar_t rij_y = coords[i*3+1] - coords[j*3+1];
@@ -249,21 +259,25 @@ static std::vector<at::Tensor> forward(
     at::Tensor& j_cf_bb, at::Tensor& j_cf_angle, at::Scalar ene_coupling_min
 )
 {
-    int32_t natoms = coords.size(0);
-    int32_t nangles = angles.size(0);
-    at::Tensor coords_grad = at::zeros_like(coords, coords.options());
-    at::Tensor ene = at::zeros({nangles}, coords.options());
-    at::Tensor dq_a = at::zeros({natoms}, coords.options());
+    int64_t natoms = coords.size(0);
+    int64_t nangles = angles.size(0);
+
+    auto opts = coords.options();
+    at::Tensor coords_grad = at::zeros_like(coords, opts);
+    at::Tensor ene = at::zeros({}, opts);
+    at::Tensor dq_a = at::zeros({natoms}, opts);
 
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 256;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (nangles+block_dim-1)/block_dim);
+    constexpr int BLOCK_SIZE = 256;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (nangles + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "cmm_angles_forward_kernel", ([&] {
-        cmm_angles_forward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        cmm_angles_forward_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
-            angles.data_ptr<int32_t>(),
+            angles.data_ptr<int64_t>(),
             theta_0.data_ptr<scalar_t>(),
             k_theta.data_ptr<scalar_t>(),
             r_eq_1.data_ptr<scalar_t>(),
@@ -283,11 +297,9 @@ static std::vector<at::Tensor> forward(
     
     ctx->save_for_backward({coords_grad, coords, angles, r_eq_1, r_eq_2, j_cf_angle, j_cf_bb});
     ctx->saved_data["nangles"] = nangles;
-    ctx->saved_data["block_dim"] = block_dim;
-    ctx->saved_data["grid_dim"] = grid_dim;
     std::vector<at::Tensor> outs;
     outs.reserve(2);
-    outs.push_back(at::sum(ene));
+    outs.push_back(ene);
     outs.push_back(dq_a);
     return outs;
 }
@@ -301,15 +313,19 @@ static std::vector<at::Tensor> backward(
     auto saved = ctx->get_saved_variables();
     at::Tensor coords_grad = saved[0] * grad_outputs[0];
 
-    int32_t nangles = static_cast<int32_t>(ctx->saved_data["nangles"].toInt());
-    int32_t block_dim = static_cast<int32_t>(ctx->saved_data["block_dim"].toInt());
-    int32_t grid_dim = static_cast<int32_t>(ctx->saved_data["grid_dim"].toInt());
+    int64_t nangles = static_cast<int64_t>(ctx->saved_data["nangles"].toInt());
+
+    auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int BLOCK_SIZE = 256;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (nangles + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
     AT_DISPATCH_FLOATING_TYPES(saved[0].scalar_type(), "cmm_angles_backward_kernel", ([&] {
-        cmm_angles_backward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        cmm_angles_backward_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             saved[1].data_ptr<scalar_t>(),
-            saved[2].data_ptr<int32_t>(),
+            saved[2].data_ptr<int64_t>(),
             saved[3].data_ptr<scalar_t>(),
             saved[4].data_ptr<scalar_t>(),
             saved[5].data_ptr<scalar_t>(),

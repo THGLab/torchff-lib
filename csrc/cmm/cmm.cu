@@ -10,16 +10,18 @@
 
 #include "common/vec3.cuh"
 #include "common/pbc.cuh"
+#include "common/reduce.cuh"
 #include "common/switch.cuh"
-#include "multipoles/multipoles.cuh"
+#include "multipoles.cuh"
 #include "dispersion/tang_tonnies.cuh"
 #include "damps.cuh"
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_nonbonded_non_elec_interaction_from_pairs_kernel(
-    scalar_t* dist_vecs,
-    int32_t* pairs,
+    scalar_t* coords,
+    scalar_t* g_box,
+    int64_t* pairs,
     scalar_t* multipoles,
     scalar_t* q_pauli, scalar_t* Kdipo_pauli, scalar_t* Kquad_pauli, scalar_t* b_pauli_ij,
     scalar_t* q_xpol, scalar_t* Kdipo_xpol, scalar_t* Kquad_xpol, scalar_t* b_xpol_ij,
@@ -29,18 +31,35 @@ __global__ void cmm_nonbonded_non_elec_interaction_from_pairs_kernel(
     scalar_t rcut_sr,
     scalar_t rcut_lr,
     scalar_t rcut_switch_buf,
-    int32_t npairs,
-    scalar_t* ene,
-    scalar_t* dist_vecs_grad,
+    int64_t npairs,
+    scalar_t* ene_out,
+    scalar_t* coords_grad,
     scalar_t* multipoles_grad,
     scalar_t* q_pauli_grad,
     scalar_t* dq_a
 )
 {
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < npairs; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs[index * 2];
-        int32_t j = pairs[index * 2 + 1];
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        ene_out[0] = scalar_t(0.0);
+    }
+
+    __shared__ scalar_t box[9];
+    __shared__ scalar_t box_inv[9];
+    if (threadIdx.x < 9) {
+        box[threadIdx.x] = g_box[threadIdx.x];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        invert_box_3x3<scalar_t>(box, box_inv);
+    }
+    __syncthreads();
+
+    scalar_t ene = scalar_t(0.0);
+
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < npairs; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs[index * 2];
+        int64_t j = pairs[index * 2 + 1];
         if ( i < 0 || j < 0 ) {
             continue;
         }
@@ -69,9 +88,12 @@ __global__ void cmm_nonbonded_non_elec_interaction_from_pairs_kernel(
         scalar_t damps[6];
         scalar_t kdi, kdj, kqi, kqj;
 
-        scalar_t drx = dist_vecs[index*3];
-        scalar_t dry = dist_vecs[index*3+1];
-        scalar_t drz = dist_vecs[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
+        scalar_t drx = rij[0];
+        scalar_t dry = rij[1];
+        scalar_t drz = rij[2];
         scalar_t dr = sqrt_(drx*drx+dry*dry+drz*drz);
 
         scalar_t etmp = 0.0;
@@ -84,7 +106,6 @@ __global__ void cmm_nonbonded_non_elec_interaction_from_pairs_kernel(
         s = clamp_((dr - rcut_sr + rcut_switch_buf) / rcut_switch_buf, ZERO, ONE);
         sg = SWITCH_GRAD(s) / rcut_switch_buf / dr;
         s = SWITCH(s);
-        // s = ONE; sg = ZERO;
 
         // Pauli
         kdi = Kdipo_pauli[i]; kdj = Kdipo_pauli[j];
@@ -224,8 +245,6 @@ __global__ void cmm_nonbonded_non_elec_interaction_from_pairs_kernel(
         s = clamp_((dr - rcut_lr + rcut_switch_buf) / rcut_switch_buf, ZERO, ONE);
         sg = SWITCH_GRAD(s) / rcut_switch_buf / dr;
         s = SWITCH(s);
-        // s = ONE;
-        // sg = ZERO;
 
         e += etmp * s;
 
@@ -233,40 +252,59 @@ __global__ void cmm_nonbonded_non_elec_interaction_from_pairs_kernel(
         dry_grad += dry_grad_tmp * s + etmp * sg * dry;
         drz_grad += drz_grad_tmp * s + etmp * sg * drz;
 
-        ene[index] = e;
-        dist_vecs_grad[index*3] = drx_grad;
-        dist_vecs_grad[index*3+1] = dry_grad;
-        dist_vecs_grad[index*3+2] = drz_grad;
+        ene += e;
+        // dr = coords[j] - coords[i], so grad wrt j is +, wrt i is -
+        atomicAdd(&coords_grad[j*3],   drx_grad);
+        atomicAdd(&coords_grad[j*3+1], dry_grad);
+        atomicAdd(&coords_grad[j*3+2], drz_grad);
+        atomicAdd(&coords_grad[i*3],   -drx_grad);
+        atomicAdd(&coords_grad[i*3+1], -dry_grad);
+        atomicAdd(&coords_grad[i*3+2], -drz_grad);
     }
+
+    block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_charge_transfer_backward_kernel(
-    scalar_t* dist_vecs,
-    int32_t* pairs,
+    scalar_t* coords,
+    scalar_t* g_box,
+    int64_t* pairs,
     scalar_t* q_ct_don, scalar_t* q_ct_acc, scalar_t* b_ct_ij, scalar_t* eps_ct_ij,
     scalar_t* dq_a_grad,
     scalar_t rcut_sr,
     scalar_t rcut_switch_buf,
-    int32_t npairs,
-    scalar_t* dist_vecs_grad
+    int64_t npairs,
+    scalar_t* coords_grad
 )
 {
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < npairs; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs[index * 2];
-        int32_t j = pairs[index * 2 + 1];
+    __shared__ scalar_t box[9];
+    __shared__ scalar_t box_inv[9];
+    if (threadIdx.x < 9) {
+        box[threadIdx.x] = g_box[threadIdx.x];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        invert_box_3x3<scalar_t>(box, box_inv);
+    }
+    __syncthreads();
+
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < npairs; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs[index * 2];
+        int64_t j = pairs[index * 2 + 1];
         if ( i < 0 || j < 0 ) {
             continue;
         }
     
-        // distance 
-        scalar_t drx = dist_vecs[index*3];
-        scalar_t dry = dist_vecs[index*3+1];
-        scalar_t drz = dist_vecs[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
+        scalar_t drx = rij[0];
+        scalar_t dry = rij[1];
+        scalar_t drz = rij[2];
         scalar_t dr = sqrt_(drx*drx+dry*dry+drz*drz);
 
-        // short-range switch
         constexpr scalar_t ZERO = scalar_t(0.0);
         constexpr scalar_t ONE = scalar_t(1.0);
 
@@ -297,9 +335,17 @@ __global__ void cmm_charge_transfer_backward_kernel(
         
         scalar_t dq_grad_ij = dq_a_grad[j] - dq_a_grad[i];
 
-        dist_vecs_grad[index*3]   += dq_grad_ij * dqij_drij_x;
-        dist_vecs_grad[index*3+1] += dq_grad_ij * dqij_drij_y;
-        dist_vecs_grad[index*3+2] += dq_grad_ij * dqij_drij_z;
+        scalar_t gx = dq_grad_ij * dqij_drij_x;
+        scalar_t gy = dq_grad_ij * dqij_drij_y;
+        scalar_t gz = dq_grad_ij * dqij_drij_z;
+
+        // dr = coords[j] - coords[i], so grad wrt j is +, wrt i is -
+        atomicAdd(&coords_grad[j*3],   gx);
+        atomicAdd(&coords_grad[j*3+1], gy);
+        atomicAdd(&coords_grad[j*3+2], gz);
+        atomicAdd(&coords_grad[i*3],   -gx);
+        atomicAdd(&coords_grad[i*3+1], -gy);
+        atomicAdd(&coords_grad[i*3+2], -gz);
     }
 }
 
@@ -311,7 +357,8 @@ public:
 
 static std::vector<at::Tensor> forward(
     torch::autograd::AutogradContext* ctx,
-    at::Tensor& dist_vecs,
+    at::Tensor& coords,
+    at::Tensor& box,
     at::Tensor& pairs,
     at::Tensor& multipoles,
     at::Tensor& q_pauli, at::Tensor& Kdipo_pauli, at::Tensor& Kquad_pauli, at::Tensor& b_pauli_ij,
@@ -322,23 +369,27 @@ static std::vector<at::Tensor> forward(
     at::Scalar rcut_sr, at::Scalar rcut_lr, at::Scalar rcut_switch_buf
 )
 {
-    int32_t npairs = pairs.size(0);
-    at::Tensor ene = at::zeros({npairs}, dist_vecs.options());
+    int64_t npairs = pairs.size(0);
 
-    at::Tensor dist_vecs_grad = at::zeros_like(dist_vecs, dist_vecs.options());
-    at::Tensor multipoles_grad = at::zeros_like(multipoles, multipoles.options());
-    at::Tensor q_pauli_grad = at::zeros_like(q_pauli, q_pauli.options());
-    at::Tensor dq_a = at::zeros_like(q_pauli, q_pauli.options());
+    auto opts = coords.options();
+    at::Tensor ene = at::zeros({}, opts);
+    at::Tensor coords_grad = at::zeros_like(coords, opts);
+    at::Tensor multipoles_grad = at::zeros_like(multipoles, opts);
+    at::Tensor q_pauli_grad = at::zeros_like(q_pauli, opts);
+    at::Tensor dq_a = at::zeros_like(q_pauli, opts);
 
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 128;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
+    constexpr int BLOCK_SIZE = 128;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (npairs + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    AT_DISPATCH_FLOATING_TYPES(dist_vecs.scalar_type(), "cmm_nonbonded_non_elec_interaction_from_pairs_kernel", ([&] {
-        cmm_nonbonded_non_elec_interaction_from_pairs_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-            dist_vecs.data_ptr<scalar_t>(),
-            pairs.data_ptr<int32_t>(),
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "cmm_nonbonded_non_elec_interaction_from_pairs_kernel", ([&] {
+        cmm_nonbonded_non_elec_interaction_from_pairs_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
+            coords.data_ptr<scalar_t>(),
+            box.data_ptr<scalar_t>(),
+            pairs.data_ptr<int64_t>(),
             multipoles.data_ptr<scalar_t>(),
             q_pauli.data_ptr<scalar_t>(), Kdipo_pauli.data_ptr<scalar_t>(), Kquad_pauli.data_ptr<scalar_t>(), b_pauli_ij.data_ptr<scalar_t>(),
             q_xpol.data_ptr<scalar_t>(), Kdipo_xpol.data_ptr<scalar_t>(), Kquad_xpol.data_ptr<scalar_t>(), b_xpol_ij.data_ptr<scalar_t>(),
@@ -351,22 +402,22 @@ static std::vector<at::Tensor> forward(
             static_cast<scalar_t>(rcut_switch_buf.toDouble()),
             npairs,
             ene.data_ptr<scalar_t>(),
-            dist_vecs_grad.data_ptr<scalar_t>(),
+            coords_grad.data_ptr<scalar_t>(),
             multipoles_grad.data_ptr<scalar_t>(),
             q_pauli_grad.data_ptr<scalar_t>(),
             dq_a.data_ptr<scalar_t>()
         );
     }));
     ctx->save_for_backward({
-        dist_vecs_grad, multipoles_grad, q_pauli_grad, 
-        dist_vecs, pairs, q_ct_don, q_ct_acc, b_ct_ij, eps_ct_ij
+        coords_grad, multipoles_grad, q_pauli_grad, 
+        coords, box, pairs, q_ct_don, q_ct_acc, b_ct_ij, eps_ct_ij
     });
     ctx->saved_data["rcut_sr"] = rcut_sr;
     ctx->saved_data["rcut_switch_buf"] = rcut_switch_buf;
 
     std::vector<at::Tensor> outs;
     outs.reserve(2);
-    outs.push_back(at::sum(ene));
+    outs.push_back(ene);
     outs.push_back(dq_a);
 
     return outs;
@@ -378,31 +429,35 @@ static std::vector<at::Tensor> backward(
 )
 {
     auto saved = ctx->get_saved_variables();
-    int32_t npairs = saved[4].size(0);
-    at::Tensor dist_vecs_grad = saved[0] * grad_outputs[0];
+    int64_t npairs = saved[5].size(0);
+    at::Tensor coords_grad = saved[0] * grad_outputs[0];
     at::Tensor ignore;
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 128;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
-    AT_DISPATCH_FLOATING_TYPES(dist_vecs_grad.scalar_type(), "cmm_charge_transfer_backward_kernel", ([&] {
-        cmm_charge_transfer_backward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+    constexpr int BLOCK_SIZE = 128;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (npairs + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    AT_DISPATCH_FLOATING_TYPES(coords_grad.scalar_type(), "cmm_charge_transfer_backward_kernel", ([&] {
+        cmm_charge_transfer_backward_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             saved[3].data_ptr<scalar_t>(),
-            saved[4].data_ptr<int32_t>(),
-            saved[5].data_ptr<scalar_t>(), 
+            saved[4].data_ptr<scalar_t>(),
+            saved[5].data_ptr<int64_t>(),
             saved[6].data_ptr<scalar_t>(), 
             saved[7].data_ptr<scalar_t>(), 
-            saved[8].data_ptr<scalar_t>(),
+            saved[8].data_ptr<scalar_t>(), 
+            saved[9].data_ptr<scalar_t>(),
             grad_outputs[1].contiguous().data_ptr<scalar_t>(), 
             static_cast<scalar_t>(ctx->saved_data["rcut_sr"].toDouble()),
             static_cast<scalar_t>(ctx->saved_data["rcut_switch_buf"].toDouble()),
             npairs,
-            dist_vecs_grad.data_ptr<scalar_t>()
+            coords_grad.data_ptr<scalar_t>()
         );
     }));
     return {
-        dist_vecs_grad, // dist_vecs grad
-        ignore,
+        coords_grad, // coords grad
+        ignore, // box
+        ignore, // pairs
         saved[1] * grad_outputs[0], // multipoles grad
         saved[2] * grad_outputs[0], ignore, ignore, ignore,
         ignore, ignore, ignore, ignore,
@@ -417,7 +472,8 @@ static std::vector<at::Tensor> backward(
 
 
 std::tuple<at::Tensor, at::Tensor> cmm_non_elec_nonbonded_interaction_from_pairs_cuda(
-    at::Tensor& dist_vecs,
+    at::Tensor& coords,
+    at::Tensor& box,
     at::Tensor& pairs,
     at::Tensor& multipoles,
     at::Tensor& q_pauli, at::Tensor& Kdipo_pauli, at::Tensor& Kquad_pauli, at::Tensor& b_pauli_ij,
@@ -429,7 +485,8 @@ std::tuple<at::Tensor, at::Tensor> cmm_non_elec_nonbonded_interaction_from_pairs
 ){
     
     auto outs = CMMNonElecNonbondedFromPairsFunctionCuda::apply(
-        dist_vecs,
+        coords,
+        box,
         pairs,
         multipoles,
         q_pauli, Kdipo_pauli, Kquad_pauli, b_pauli_ij,

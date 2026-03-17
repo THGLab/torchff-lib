@@ -9,29 +9,36 @@
 #include <cuda_runtime.h>
 
 #include "bond/morse_bond.cuh"
+#include "common/reduce.cuh"
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_field_dependent_morse_bond_kernel(
     scalar_t* coords,
-    int32_t* bonds,
+    int64_t* bonds,
     scalar_t* req_0,
     scalar_t* kb_0,
     scalar_t* d,
     scalar_t* dipole_deriv_1,
     scalar_t* dipole_deriv_2,
     scalar_t* efield,
-    int32_t nbonds,
-    scalar_t* ene,
+    int64_t nbonds,
+    scalar_t* ene_out,
     scalar_t* coords_grad,
     scalar_t* efield_grad
 )
 {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        ene_out[0] = scalar_t(0.0);
+    }
+    __syncthreads();
 
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < nbonds; index += gridDim.x * blockDim.x) {
-        int32_t i = bonds[index * 2];
-        int32_t j = bonds[index * 2 + 1];
+    scalar_t ene = scalar_t(0.0);
+
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < nbonds; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = bonds[index * 2];
+        int64_t j = bonds[index * 2 + 1];
         scalar_t rx = coords[j*3] - coords[i*3];
         scalar_t ry = coords[j*3+1] - coords[i*3+1];
         scalar_t rz = coords[j*3+2] - coords[i*3+2];
@@ -42,7 +49,7 @@ __global__ void cmm_field_dependent_morse_bond_kernel(
             efield[j*3], efield[j*3+1], efield[j*3+2], dipole_deriv_1[index], dipole_deriv_2[index],
             &e, &drx, &dry, &drz, &defx, &defy, &defz
         );
-        ene[index] = e;
+        ene += e;
         atomicAdd(&coords_grad[i*3], -drx);
         atomicAdd(&coords_grad[i*3+1], -dry);
         atomicAdd(&coords_grad[i*3+2], -drz);
@@ -56,6 +63,8 @@ __global__ void cmm_field_dependent_morse_bond_kernel(
         atomicAdd(&efield_grad[j*3+2], defz);
 
     }
+
+    block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
 }
 
 
@@ -71,20 +80,24 @@ static at::Tensor forward(
     at::Tensor& efield
 )
 {
-    int32_t nbonds = bonds.size(0);
-    at::Tensor coords_grad = at::zeros_like(coords, coords.options());
-    at::Tensor efield_grad = at::zeros_like(efield, efield.options());
-    at::Tensor ene = at::zeros({nbonds}, coords.options());
+    int64_t nbonds = bonds.size(0);
+
+    auto opts = coords.options();
+    at::Tensor coords_grad = at::zeros_like(coords, opts);
+    at::Tensor efield_grad = at::zeros_like(efield, opts);
+    at::Tensor ene = at::zeros({}, opts);
 
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 256;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (nbonds+block_dim-1)/block_dim);
+    constexpr int BLOCK_SIZE = 256;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (nbonds + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "cmm_field_dependent_morse_bond_kernel", ([&] {
-        cmm_field_dependent_morse_bond_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        cmm_field_dependent_morse_bond_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
-            bonds.data_ptr<int32_t>(),
+            bonds.data_ptr<int64_t>(),
             req_0.data_ptr<scalar_t>(),
             kb_0.data_ptr<scalar_t>(),
             D.data_ptr<scalar_t>(),
@@ -99,7 +112,7 @@ static at::Tensor forward(
     }));
     
     ctx->save_for_backward({coords_grad, efield_grad});
-    return at::sum(ene);
+    return ene;
 }
 
 

@@ -10,38 +10,56 @@
 
 #include "common/vec3.cuh"
 #include "common/pbc.cuh"
-#include "multipoles/multipoles.cuh"
+#include "common/reduce.cuh"
+#include "multipoles.cuh"
 #include "damps.cuh"
 #include "ewald/damps.cuh"
 #include "common/switch.cuh"
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_elec_from_pairs_forward_kernel(
-    scalar_t* dist_vecs,
-    int32_t* pairs,
-    scalar_t* dist_vecs_excl,
-    int32_t* pairs_excl,
+    scalar_t* coords,
+    scalar_t* g_box,
+    int64_t* pairs,
+    int64_t* pairs_excl,
     scalar_t* multipoles,
     scalar_t* Z, scalar_t* b_elec_ij, scalar_t* b_elec,
     scalar_t ewald_alpha,
     scalar_t rcut_sr,
     scalar_t rcut_lr,
     scalar_t rcut_switch_buf,
-    int32_t npairs,
-    int32_t npairs_excl,
-    scalar_t* ene_elec, 
-    scalar_t* ene_elec_excl,
+    int64_t npairs,
+    int64_t npairs_excl,
+    scalar_t* ene_out,
     scalar_t* epot,
     scalar_t* efield
 )
 {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        ene_out[0] = scalar_t(0.0);
+    }
+
+    __shared__ scalar_t box[9];
+    __shared__ scalar_t box_inv[9];
+    if (threadIdx.x < 9) {
+        box[threadIdx.x] = g_box[threadIdx.x];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        invert_box_3x3<scalar_t>(box, box_inv);
+    }
+    __syncthreads();
+
     constexpr scalar_t ZERO = scalar_t(0.0);
     constexpr scalar_t ONE  = scalar_t(1.0);
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < npairs; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs[index * 2];
-        int32_t j = pairs[index * 2 + 1];
+
+    scalar_t ene = scalar_t(0.0);
+
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < npairs; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs[index * 2];
+        int64_t j = pairs[index * 2 + 1];
         if ( i < 0 || j < 0 ) {
             continue;
         }
@@ -69,9 +87,12 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
         scalar_t zi = Z[i];
         scalar_t zj = Z[j];
 
-        scalar_t drx = dist_vecs[index*3];
-        scalar_t dry = dist_vecs[index*3+1];
-        scalar_t drz = dist_vecs[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
+        scalar_t drx = rij[0];
+        scalar_t dry = rij[1];
+        scalar_t drz = rij[2];
         scalar_t dr = sqrt_(drx*drx+dry*dry+drz*drz);
 
         scalar_t epot_i = scalar_t(0.0);
@@ -93,7 +114,6 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
             );
             e += etmp;
 
-            // core-shell
             /* core-j shell-i */
             one_center_damps(dr, b_elec[i], damps);
             pairwise_multipole_kernel_with_grad(
@@ -167,7 +187,7 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
             
         }
 
-        ene_elec[index] = e;
+        ene += e;
 
         atomicAdd(&epot[i], epot_i);
         atomicAdd(&epot[j], epot_j);
@@ -181,9 +201,9 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
         atomicAdd(&efield[j*3+2], efield_j[2]);
     }
 
-    for (int32_t index = start; index < npairs_excl; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs_excl[index * 2];
-        int32_t j = pairs_excl[index * 2 + 1];
+    for (int64_t index = start; index < npairs_excl; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs_excl[index * 2];
+        int64_t j = pairs_excl[index * 2 + 1];
 
         scalar_t e = scalar_t(0.0);
         scalar_t mi[10]; 
@@ -200,9 +220,12 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
 
         scalar_t damps[6];
 
-        scalar_t drx = dist_vecs_excl[index*3];
-        scalar_t dry = dist_vecs_excl[index*3+1];
-        scalar_t drz = dist_vecs_excl[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
+        scalar_t drx = rij[0];
+        scalar_t dry = rij[1];
+        scalar_t drz = rij[2];
         scalar_t dr = sqrt_(drx*drx+dry*dry+drz*drz);
 
         ewald_erfc_damps<scalar_t, 11>(dr, ewald_alpha, damps);
@@ -216,7 +239,7 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
             mj_grad, mj_grad+1, mj_grad+2, mj_grad+3, mj_grad+4, mj_grad+5, mj_grad+6, mj_grad+7, mj_grad+8, mj_grad+9
         );
 
-        ene_elec_excl[index] = e;
+        ene += e;
 
         atomicAdd(&epot[i], mi_grad[0]);
         atomicAdd(&epot[j], mj_grad[0]);
@@ -229,31 +252,43 @@ __global__ void cmm_elec_from_pairs_forward_kernel(
         atomicAdd(&efield[j*3+1], -mj_grad[2]);
         atomicAdd(&efield[j*3+2], -mj_grad[3]);
     }
+
+    block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
 }
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_elec_from_pairs_backward_kernel(
-    scalar_t* dist_vecs,
-    int32_t* pairs,
-    scalar_t* dist_vecs_excl,
-    int32_t* pairs_excl,
+    scalar_t* coords,
+    scalar_t* g_box,
+    int64_t* pairs,
+    int64_t* pairs_excl,
     scalar_t* multipoles,
     scalar_t* Z, scalar_t* b_elec_ij, scalar_t* b_elec,
     scalar_t ewald_alpha,
     scalar_t rcut_sr,
     scalar_t rcut_lr,
     scalar_t rcut_switch_buf,
-    int32_t npairs,
-    int32_t npairs_excl,
+    int64_t npairs,
+    int64_t npairs_excl,
     scalar_t* ene_grad,
     scalar_t* epot_grad,
     scalar_t* efield_grad,
-    scalar_t* dist_vecs_grad,
-    scalar_t* dist_vecs_excl_grad,
+    scalar_t* coords_grad,
     scalar_t* multipoles_grad
 )
 {
+    __shared__ scalar_t box[9];
+    __shared__ scalar_t box_inv[9];
+    if (threadIdx.x < 9) {
+        box[threadIdx.x] = g_box[threadIdx.x];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        invert_box_3x3<scalar_t>(box, box_inv);
+    }
+    __syncthreads();
+
     constexpr scalar_t ZERO = scalar_t(0.0);
     constexpr scalar_t ONE  = scalar_t(1.0);
     
@@ -319,10 +354,10 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
     scalar_t mi[10]; 
     scalar_t mj[10]; 
 
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < npairs; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs[index * 2];
-        int32_t j = pairs[index * 2 + 1];
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < npairs; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs[index * 2];
+        int64_t j = pairs[index * 2 + 1];
         if ( i < 0 || j < 0 ) {
             continue;
         }
@@ -339,9 +374,12 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
         scalar_t zi = Z[i];
         scalar_t zj = Z[j];
 
-        scalar_t drx = dist_vecs[index*3];
-        scalar_t dry = dist_vecs[index*3+1];
-        scalar_t drz = dist_vecs[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
+        scalar_t drx = rij[0];
+        scalar_t dry = rij[1];
+        scalar_t drz = rij[2];
         scalar_t dr = sqrt_(drx*drx+dry*dry+drz*drz);
 
         scalar_t epot_grad_i = epot_grad[i];
@@ -382,7 +420,6 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
             dry_grad += e_grad * (dry_grad_tmp * s + tmp * sg * dry);
             drz_grad += e_grad * (drz_grad_tmp * s + tmp * sg * drz);
 
-            // core-shell
             /* core-j shell-i */
             one_center_damps(dr, b_elec[i], damps);
             pairwise_multipole_kernel_with_grad(
@@ -520,10 +557,13 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
             drz_grad += mi_grad_tmp[6]*efield_x_grad_i-mj_grad_tmp[6]*efield_x_grad_j + mi_grad_tmp[8]*efield_y_grad_i-mj_grad_tmp[8]*efield_y_grad_j + mi_grad_tmp[9]*efield_z_grad_i-mj_grad_tmp[9]*efield_z_grad_j;
         }
 
-        // write back gradient
-        dist_vecs_grad[index*3] = drx_grad;
-        dist_vecs_grad[index*3+1] = dry_grad;
-        dist_vecs_grad[index*3+2] = drz_grad;
+        // dr = coords[j] - coords[i], so grad wrt j is +, wrt i is -
+        atomicAdd(&coords_grad[j*3],   drx_grad);
+        atomicAdd(&coords_grad[j*3+1], dry_grad);
+        atomicAdd(&coords_grad[j*3+2], drz_grad);
+        atomicAdd(&coords_grad[i*3],   -drx_grad);
+        atomicAdd(&coords_grad[i*3+1], -dry_grad);
+        atomicAdd(&coords_grad[i*3+2], -drz_grad);
 
         #pragma unroll
         for (int n = 0; n < 10; n++) {
@@ -532,9 +572,9 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
         }
     }
 
-    for (int32_t index = start; index < npairs_excl; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs_excl[index * 2];
-        int32_t j = pairs_excl[index * 2 + 1];
+    for (int64_t index = start; index < npairs_excl; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs_excl[index * 2];
+        int64_t j = pairs_excl[index * 2 + 1];
 
         #pragma unroll
         for (int n = 0; n < 10; n++) {
@@ -542,9 +582,12 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
             mj[n] = multipoles[j*10+n];
         }
 
-        scalar_t drx = dist_vecs_excl[index*3];
-        scalar_t dry = dist_vecs_excl[index*3+1];
-        scalar_t drz = dist_vecs_excl[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
+        scalar_t drx = rij[0];
+        scalar_t dry = rij[1];
+        scalar_t drz = rij[2];
         scalar_t dr = sqrt_(drx*drx+dry*dry+drz*drz);
 
         scalar_t epot_grad_i = epot_grad[i];
@@ -569,7 +612,6 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
             interaction_tensor
         );
 
-        // multipole gradient
         mi_grad[0] = e_grad*mi_grad_tmp[0] + epot_grad_j*drinv - efield_x_grad_j*tx - efield_y_grad_j*ty - efield_z_grad_j*tz;
         mi_grad[1] = e_grad*mi_grad_tmp[1] - epot_grad_j*tx + efield_x_grad_j*txx + efield_y_grad_j*txy + efield_z_grad_j*txz;
         mi_grad[2] = e_grad*mi_grad_tmp[2] - epot_grad_j*ty + efield_x_grad_j*txy + efield_y_grad_j*tyy + efield_z_grad_j*tyz;
@@ -592,24 +634,24 @@ __global__ void cmm_elec_from_pairs_backward_kernel(
         mj_grad[8] = e_grad*mj_grad_tmp[8] + epot_grad_i*tyz + efield_x_grad_i*txyz + efield_y_grad_i*tyyz + efield_z_grad_i*tzzy;
         mj_grad[9] = e_grad*mj_grad_tmp[9] + epot_grad_i*tzz + efield_x_grad_i*tzzx + efield_y_grad_i*tzzy + efield_z_grad_i*tzzz;
 
-        // coordinate gradient - contribution from energy
         drx_grad = e_grad * drx_grad_tmp;
         dry_grad = e_grad * dry_grad_tmp;
         drz_grad = e_grad * drz_grad_tmp;
 
-        // coordinate gradient - contribution from electric potential
         drx_grad += -mi_grad_tmp[1]*epot_grad_i + mj_grad_tmp[1]*epot_grad_j;
         dry_grad += -mi_grad_tmp[2]*epot_grad_i + mj_grad_tmp[2]*epot_grad_j;
         drz_grad += -mi_grad_tmp[3]*epot_grad_i + mj_grad_tmp[3]*epot_grad_j;
 
-        // coordinate gradient - contribution from electric field
         drx_grad += mi_grad_tmp[4]*efield_x_grad_i-mj_grad_tmp[4]*efield_x_grad_j + mi_grad_tmp[5]*efield_y_grad_i-mj_grad_tmp[5]*efield_y_grad_j + mi_grad_tmp[6]*efield_z_grad_i-mj_grad_tmp[6]*efield_z_grad_j;
         dry_grad += mi_grad_tmp[5]*efield_x_grad_i-mj_grad_tmp[5]*efield_x_grad_j + mi_grad_tmp[7]*efield_y_grad_i-mj_grad_tmp[7]*efield_y_grad_j + mi_grad_tmp[8]*efield_z_grad_i-mj_grad_tmp[8]*efield_z_grad_j;
         drz_grad += mi_grad_tmp[6]*efield_x_grad_i-mj_grad_tmp[6]*efield_x_grad_j + mi_grad_tmp[8]*efield_y_grad_i-mj_grad_tmp[8]*efield_y_grad_j + mi_grad_tmp[9]*efield_z_grad_i-mj_grad_tmp[9]*efield_z_grad_j;
 
-        dist_vecs_excl_grad[index*3] = drx_grad;
-        dist_vecs_excl_grad[index*3+1] = dry_grad;
-        dist_vecs_excl_grad[index*3+2] = drz_grad;
+        atomicAdd(&coords_grad[j*3],   drx_grad);
+        atomicAdd(&coords_grad[j*3+1], dry_grad);
+        atomicAdd(&coords_grad[j*3+2], drz_grad);
+        atomicAdd(&coords_grad[i*3],   -drx_grad);
+        atomicAdd(&coords_grad[i*3+1], -dry_grad);
+        atomicAdd(&coords_grad[i*3+2], -drz_grad);
 
         #pragma unroll
         for (int n = 0; n < 10; n++) {
@@ -626,8 +668,8 @@ public:
 
 static std::vector<at::Tensor> forward(
     torch::autograd::AutogradContext* ctx,
-    at::Tensor& dist_vecs, at::Tensor& pairs,
-    at::Tensor& dist_vecs_excl, at::Tensor& pairs_excl,
+    at::Tensor& coords, at::Tensor& box,
+    at::Tensor& pairs, at::Tensor& pairs_excl,
     at::Tensor& multipoles,
     at::Tensor& Z, at::Tensor& b_elec_ij, at::Tensor& b_elec,
     at::Scalar ewald_alpha,
@@ -636,25 +678,27 @@ static std::vector<at::Tensor> forward(
     at::Scalar rcut_switch_buf
 )
 {
-    int32_t npairs = pairs.size(0);
-    int32_t npairs_excl = pairs_excl.size(0);
-    at::Tensor ene_elec = at::zeros({npairs}, dist_vecs.options());
-    at::Tensor ene_elec_excl = at::zeros({npairs_excl}, dist_vecs_excl.options());
+    int64_t npairs = pairs.size(0);
+    int64_t npairs_excl = pairs_excl.size(0);
 
-    at::Tensor epot = at::zeros({multipoles.size(0)}, multipoles.options());
-    at::Tensor efield = at::zeros({multipoles.size(0), 3}, multipoles.options());
+    auto opts = coords.options();
+    at::Tensor ene = at::zeros({}, opts);
+    at::Tensor epot = at::zeros({multipoles.size(0)}, opts);
+    at::Tensor efield = at::zeros({multipoles.size(0), 3}, opts);
 
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 128;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
+    constexpr int BLOCK_SIZE = 128;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (npairs + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    AT_DISPATCH_FLOATING_TYPES(dist_vecs.scalar_type(), "cmm_elec_from_pairs_forward_kernel", ([&] {
-        cmm_elec_from_pairs_forward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-            dist_vecs.data_ptr<scalar_t>(),
-            pairs.data_ptr<int32_t>(),
-            dist_vecs_excl.data_ptr<scalar_t>(),
-            pairs_excl.data_ptr<int32_t>(),
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "cmm_elec_from_pairs_forward_kernel", ([&] {
+        cmm_elec_from_pairs_forward_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
+            coords.data_ptr<scalar_t>(),
+            box.data_ptr<scalar_t>(),
+            pairs.data_ptr<int64_t>(),
+            pairs_excl.data_ptr<int64_t>(),
             multipoles.data_ptr<scalar_t>(),
             Z.data_ptr<scalar_t>(),
             b_elec_ij.data_ptr<scalar_t>(),
@@ -665,15 +709,14 @@ static std::vector<at::Tensor> forward(
             static_cast<scalar_t>(rcut_switch_buf.toDouble()),
             npairs,
             npairs_excl,
-            ene_elec.data_ptr<scalar_t>(),
-            ene_elec_excl.data_ptr<scalar_t>(),
+            ene.data_ptr<scalar_t>(),
             epot.data_ptr<scalar_t>(),
             efield.data_ptr<scalar_t>()
         );
     }));
     
     ctx->save_for_backward({
-        dist_vecs, pairs, dist_vecs_excl, pairs_excl,
+        coords, box, pairs, pairs_excl,
         multipoles, Z, b_elec_ij, b_elec
     });
     ctx->saved_data["rcut_sr"] = rcut_sr;
@@ -683,7 +726,7 @@ static std::vector<at::Tensor> forward(
 
     std::vector<at::Tensor> outs;
     outs.reserve(3);
-    outs.push_back(at::sum(ene_elec)+at::sum(ene_elec_excl));
+    outs.push_back(ene);
     outs.push_back(epot);
     outs.push_back(efield);
 
@@ -697,24 +740,25 @@ static std::vector<at::Tensor> backward(
 {
     auto saved = ctx->get_saved_variables();
 
-    at::Tensor dist_vecs_grad = at::zeros_like(saved[0], saved[0].options());
+    at::Tensor coords_grad = at::zeros_like(saved[0], saved[0].options());
     at::Tensor multipoles_grad = at::zeros_like(saved[4], saved[4].options());
-    at::Tensor dist_vecs_excl_grad = at::zeros_like(saved[2], saved[2].options());
 
-    int32_t npairs = saved[1].size(0);
-    int32_t npairs_excl = saved[3].size(0);
+    int64_t npairs = saved[2].size(0);
+    int64_t npairs_excl = saved[3].size(0);
 
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 128;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
+    constexpr int BLOCK_SIZE = 128;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (npairs + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
     AT_DISPATCH_FLOATING_TYPES(saved[0].scalar_type(), "cmm_elec_from_pairs_backward_kernel", ([&] {
-        cmm_elec_from_pairs_backward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        cmm_elec_from_pairs_backward_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             saved[0].data_ptr<scalar_t>(),
-            saved[1].data_ptr<int32_t>(),
-            saved[2].data_ptr<scalar_t>(),
-            saved[3].data_ptr<int32_t>(),
+            saved[1].data_ptr<scalar_t>(),
+            saved[2].data_ptr<int64_t>(),
+            saved[3].data_ptr<int64_t>(),
             saved[4].data_ptr<scalar_t>(),
             saved[5].data_ptr<scalar_t>(),
             saved[6].data_ptr<scalar_t>(),
@@ -728,18 +772,17 @@ static std::vector<at::Tensor> backward(
             grad_outputs[0].contiguous().data_ptr<scalar_t>(),
             grad_outputs[1].contiguous().data_ptr<scalar_t>(),
             grad_outputs[2].contiguous().data_ptr<scalar_t>(),
-            dist_vecs_grad.data_ptr<scalar_t>(),
-            dist_vecs_excl_grad.data_ptr<scalar_t>(),
+            coords_grad.data_ptr<scalar_t>(),
             multipoles_grad.data_ptr<scalar_t>()
         );
     }));
 
     at::Tensor ignore;
     return {
-        dist_vecs_grad, // dist_vecs grad
-        ignore,
-        dist_vecs_excl_grad,
-        ignore, 
+        coords_grad, // coords grad
+        ignore, // box
+        ignore, // pairs
+        ignore, // pairs_excl
         multipoles_grad, 
         ignore, ignore, ignore, 
         ignore, ignore, ignore, ignore
@@ -750,8 +793,8 @@ static std::vector<at::Tensor> backward(
 
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> cmm_elec_from_pairs_cuda(
-    at::Tensor& dist_vecs, at::Tensor& pairs,
-    at::Tensor& dist_vecs_excl, at::Tensor& pairs_excl,
+    at::Tensor& coords, at::Tensor& box,
+    at::Tensor& pairs, at::Tensor& pairs_excl,
     at::Tensor& multipoles,
     at::Tensor& Z, at::Tensor& b_elec_ij, at::Tensor& b_elec,
     at::Scalar ewald_alpha,
@@ -761,8 +804,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> cmm_elec_from_pairs_cuda(
 ){
     
     auto outs = CMMElectrostaticsFromPairsFunctionCuda::apply(
-        dist_vecs, pairs,
-        dist_vecs_excl, pairs_excl,
+        coords, box,
+        pairs, pairs_excl,
         multipoles,
         Z, b_elec_ij, b_elec,
         ewald_alpha, rcut_sr, rcut_lr, rcut_switch_buf

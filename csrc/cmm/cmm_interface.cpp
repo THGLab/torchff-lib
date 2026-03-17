@@ -6,7 +6,7 @@
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
   m.def(
     "cmm_non_elec_nonbonded_interaction_from_pairs("
-      "Tensor dist_vecs, Tensor pairs, Tensor multipoles, "
+      "Tensor coords, Tensor box, Tensor pairs, Tensor multipoles, "
       "Tensor q_pauli, Tensor Kdipo_pauli, Tensor Kquad_pauli, Tensor b_pauli_ij, "
       "Tensor q_xpol, Tensor Kdipo_xpol, Tensor Kquad_xpol, Tensor b_xpol_ij, "
       "Tensor q_ct_don, Tensor Kdipo_ct_don, Tensor Kquad_ct_don, "
@@ -17,8 +17,8 @@ TORCH_LIBRARY_FRAGMENT(torchff, m) {
   );
   m.def(
     "cmm_elec_from_pairs("
-      "Tensor dist_vecs, Tensor pairs, "
-      "Tensor dist_vecs_excl, Tensor pairs_excl, "
+      "Tensor coords, Tensor box, "
+      "Tensor pairs, Tensor pairs_excl, "
       "Tensor multipoles, "
       "Tensor Z, Tensor b_elec_ij, Tensor b_elec, "
       "Scalar ewald_alpha, "
@@ -51,12 +51,12 @@ TORCH_LIBRARY_FRAGMENT(torchff, m) {
     "compute_cmm_polarization_real_space("
       "Tensor coords, Tensor box, Tensor pairs, Tensor pairs_excl, Tensor b_elec_ij, Tensor vec_in, "
       "Scalar ewald_alpha, Scalar rcut_sr, Scalar rcut_lr, "
-      "Tensor (a!) vec_out"
+      "Tensor(a!) vec_out"
     ") -> ()"
   );
   m.def(
     "cmm_polarization_energy_from_induced_multipoles("
-      "Tensor dist_vecs, Tensor pairs, Tensor dist_vecs_excl, Tensor pairs_excl, "
+      "Tensor coords, Tensor box, Tensor pairs, Tensor pairs_excl, "
       "Tensor induced_multipoles, Tensor b_elec_ij, "
       "Scalar ewald_alpha, Scalar rcut_sr, Scalar rcut_lr, Scalar natoms "
     ") -> Tensor"

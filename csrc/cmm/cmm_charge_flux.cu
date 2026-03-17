@@ -10,23 +10,23 @@
 
 #include "common/vec3.cuh"
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_charge_flux_bond_forward_kernel(
     scalar_t* coords,
-    int32_t* bonds,
+    int64_t* bonds,
     scalar_t* req,
     scalar_t* j_cf,
     scalar_t* j_cf_pauli,
-    int32_t nbonds,
+    int64_t nbonds,
     scalar_t* dq_a,
     scalar_t* dq_pauli_a
 )
 {
 
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < nbonds; index += gridDim.x * blockDim.x) {
-        int32_t i = bonds[index * 2];
-        int32_t j = bonds[index * 2 + 1];
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < nbonds; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = bonds[index * 2];
+        int64_t j = bonds[index * 2 + 1];
         scalar_t rx = coords[j*3] - coords[i*3];
         scalar_t ry = coords[j*3+1] - coords[i*3+1];
         scalar_t rz = coords[j*3+2] - coords[i*3+2];
@@ -44,23 +44,23 @@ __global__ void cmm_charge_flux_bond_forward_kernel(
 }
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_charge_flux_bond_backward_kernel(
     scalar_t* coords,
-    int32_t* bonds,
+    int64_t* bonds,
     scalar_t* req,
     scalar_t* j_cf,
     scalar_t* j_cf_pauli,
-    int32_t nbonds,
+    int64_t nbonds,
     scalar_t* dq_a_grad,
     scalar_t* dq_pauli_a_grad,
     scalar_t* coords_grad
 )
 {
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < nbonds; index += gridDim.x * blockDim.x) {
-        int32_t i = bonds[index * 2];
-        int32_t j = bonds[index * 2 + 1];
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < nbonds; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = bonds[index * 2];
+        int64_t j = bonds[index * 2 + 1];
         scalar_t rx = coords[j*3] - coords[i*3];
         scalar_t ry = coords[j*3+1] - coords[i*3+1];
         scalar_t rz = coords[j*3+2] - coords[i*3+2];
@@ -86,20 +86,22 @@ static std::vector<at::Tensor> forward(
     at::Tensor& j_cf, at::Tensor& j_cf_pauli
 )
 {
-    int32_t nbonds = bonds.size(0);
-    int32_t natoms = coords.size(0);
+    int64_t nbonds = bonds.size(0);
+    int64_t natoms = coords.size(0);
     at::Tensor dq_a = at::zeros({natoms}, coords.options());
     at::Tensor dq_a_pauli = at::zeros({natoms}, coords.options());
 
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 256;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (nbonds+block_dim-1)/block_dim);
+    constexpr int BLOCK_SIZE = 256;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (nbonds + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "cmm_charge_flux_bond_forward_kernel", ([&] {
-        cmm_charge_flux_bond_forward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        cmm_charge_flux_bond_forward_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
-            bonds.data_ptr<int32_t>(),
+            bonds.data_ptr<int64_t>(),
             req.data_ptr<scalar_t>(),
             j_cf.data_ptr<scalar_t>(),
             j_cf_pauli.data_ptr<scalar_t>(),
@@ -111,8 +113,6 @@ static std::vector<at::Tensor> forward(
 
     ctx->save_for_backward({coords, bonds, req, j_cf, j_cf_pauli});
     ctx->saved_data["nbonds"] = nbonds;
-    ctx->saved_data["block_dim"] = block_dim;
-    ctx->saved_data["grid_dim"] = grid_dim;
     std::vector<at::Tensor> outs;
     outs.reserve(2);
     outs.push_back(dq_a);
@@ -128,15 +128,19 @@ static std::vector<at::Tensor> backward(
 {
     auto saved = ctx->get_saved_variables();
     at::Tensor coords_grad = at::zeros_like(saved[0], saved[0].options());
-    int32_t nbonds = static_cast<int32_t>(ctx->saved_data["nbonds"].toInt());
-    int32_t block_dim = static_cast<int32_t>(ctx->saved_data["block_dim"].toInt());
-    int32_t grid_dim = static_cast<int32_t>(ctx->saved_data["grid_dim"].toInt());
+    int64_t nbonds = static_cast<int64_t>(ctx->saved_data["nbonds"].toInt());
+
+    auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
+    constexpr int BLOCK_SIZE = 256;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (nbonds + BLOCK_SIZE - 1) / BLOCK_SIZE);
     
     AT_DISPATCH_FLOATING_TYPES(saved[0].scalar_type(), "cmm_charge_flux_bond_backward_kernel", ([&] {
-        cmm_charge_flux_bond_backward_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        cmm_charge_flux_bond_backward_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             saved[0].data_ptr<scalar_t>(),
-            saved[1].data_ptr<int32_t>(),
+            saved[1].data_ptr<int64_t>(),
             saved[2].data_ptr<scalar_t>(),
             saved[3].data_ptr<scalar_t>(),
             saved[4].data_ptr<scalar_t>(),

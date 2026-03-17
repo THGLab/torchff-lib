@@ -10,6 +10,7 @@
 
 #include "common/vec3.cuh"
 #include "common/pbc.cuh"
+#include "common/reduce.cuh"
 #include "damps.cuh"
 #include "ewald/damps.cuh"
 
@@ -50,11 +51,9 @@ __device__ __forceinline__ void pairwise_electric_data_multipole_kernel_rank_1(
     scalar_t tyz = 3 * dry * drz * drinv5;
     scalar_t tzz = 3 * drz * drz * drinv5 - drinv3;     
     
-    // charge gradient - electric potential
     *c0_i_g = drinv * c0_j + tx * dx_j + ty * dy_j + tz * dz_j;
     *c0_j_g = drinv * c0_i - tx * dx_i - ty * dy_i - tz * dz_i;
     
-    // dipole gradient - electric field
     *dx_i_g = -c0_j * tx - txx * dx_j - txy * dy_j - txz * dz_j;
     *dy_i_g = -c0_j * ty - txy * dx_j - tyy * dy_j - tyz * dz_j;
     *dz_i_g = -c0_j * tz - txz * dx_j - tyz * dy_j - tzz * dz_j;
@@ -119,7 +118,6 @@ __device__ __forceinline__ void pairwise_multipole_kernel_with_grad_rank_1(
     scalar_t tzzy = -15 * z2 * dry * drinv7 + 3 * dry * drinv5;
     scalar_t txyz = -15 * xyz * drinv7;
 
-    // interaction tensor graident
     scalar_t c0prod = c0_i * c0_j;
 
     scalar_t tx_g = c0_i * dx_j - c0_j * dx_i; 
@@ -147,37 +145,51 @@ __device__ __forceinline__ void pairwise_multipole_kernel_with_grad_rank_1(
 }
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void cmm_polarization_energy_from_induced_multipoles_kernel(
-    scalar_t* dist_vecs,
-    int32_t* pairs,
-    scalar_t* dist_vecs_excl,
-    int32_t* pairs_excl,
+    scalar_t* coords,
+    scalar_t* g_box,
+    int64_t* pairs,
+    int64_t* pairs_excl,
     scalar_t* charges,
     scalar_t* dipoles,
     scalar_t* b_elec_ij,
-    int32_t npairs,
-    int32_t npairs_excl,
+    int64_t npairs,
+    int64_t npairs_excl,
     scalar_t ewald_alpha,
     scalar_t rcut_sr,
     scalar_t rcut_lr,
-    scalar_t* ene,
-    scalar_t* ene_excl,
-    scalar_t* dist_vecs_grad,
-    scalar_t* dist_vecs_excl_grad
+    scalar_t* ene_out,
+    scalar_t* coords_grad
 )
 {
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < npairs; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs[index * 2];
-        int32_t j = pairs[index * 2 + 1];
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        ene_out[0] = scalar_t(0.0);
+    }
+
+    __shared__ scalar_t box[9];
+    __shared__ scalar_t box_inv[9];
+    if (threadIdx.x < 9) {
+        box[threadIdx.x] = g_box[threadIdx.x];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        invert_box_3x3<scalar_t>(box, box_inv);
+    }
+    __syncthreads();
+
+    scalar_t ene = scalar_t(0.0);
+
+    int64_t start = threadIdx.x + BLOCK_SIZE * blockIdx.x;
+    for (int64_t index = start; index < npairs; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs[index * 2];
+        int64_t j = pairs[index * 2 + 1];
         if ( i < 0 || j < 0 ) {
             continue;
         }
-        scalar_t rij[3];
-        rij[0] = dist_vecs[index*3];
-        rij[1] = dist_vecs[index*3+1];
-        rij[2] = dist_vecs[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
         scalar_t dr = norm3d_(rij[0], rij[1], rij[2]);
         if ( dr >= rcut_lr ) { continue; }
 
@@ -201,21 +213,24 @@ __global__ void cmm_polarization_energy_from_induced_multipoles_kernel(
             c0_i, dx_i, dy_i, dz_i, c0_j, dx_j, dy_j, dz_j, rij[0], rij[1], rij[2],
             damps[0], damps[1], damps[2], damps[3], &e, &drx_g, &dry_g, &drz_g
         );
-        ene[index] = e;
+        ene += e;
 
-        atomicAdd(&dist_vecs_grad[index*3], drx_g);
-        atomicAdd(&dist_vecs_grad[index*3+1], dry_g);
-        atomicAdd(&dist_vecs_grad[index*3+2], drz_g);
+        // dr = coords[j] - coords[i], so grad wrt j is +, wrt i is -
+        atomicAdd(&coords_grad[j*3],   drx_g);
+        atomicAdd(&coords_grad[j*3+1], dry_g);
+        atomicAdd(&coords_grad[j*3+2], drz_g);
+        atomicAdd(&coords_grad[i*3],   -drx_g);
+        atomicAdd(&coords_grad[i*3+1], -dry_g);
+        atomicAdd(&coords_grad[i*3+2], -drz_g);
     }
 
-    for (int32_t index = start; index < npairs_excl; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs_excl[index * 2];
-        int32_t j = pairs_excl[index * 2 + 1];
+    for (int64_t index = start; index < npairs_excl; index += gridDim.x * BLOCK_SIZE) {
+        int64_t i = pairs_excl[index * 2];
+        int64_t j = pairs_excl[index * 2 + 1];
 
-        scalar_t rij[3];
-        rij[0] = dist_vecs_excl[index*3];
-        rij[1] = dist_vecs_excl[index*3+1];
-        rij[2] = dist_vecs_excl[index*3+2];
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
         scalar_t dr = norm3d_(rij[0], rij[1], rij[2]);
 
         scalar_t c0_i = charges[i];
@@ -234,12 +249,17 @@ __global__ void cmm_polarization_energy_from_induced_multipoles_kernel(
             damps[0]-scalar_t(1.0), damps[1]-scalar_t(1.0), damps[2]-scalar_t(1.0), damps[3]-scalar_t(1.0), 
             &e, &drx_g, &dry_g, &drz_g
         );
-        ene_excl[index] = e;
+        ene += e;
 
-        atomicAdd(&dist_vecs_excl_grad[index*3], drx_g);
-        atomicAdd(&dist_vecs_excl_grad[index*3+1], dry_g);
-        atomicAdd(&dist_vecs_excl_grad[index*3+2], drz_g);
+        atomicAdd(&coords_grad[j*3],   drx_g);
+        atomicAdd(&coords_grad[j*3+1], dry_g);
+        atomicAdd(&coords_grad[j*3+2], drz_g);
+        atomicAdd(&coords_grad[i*3],   -drx_g);
+        atomicAdd(&coords_grad[i*3+1], -dry_g);
+        atomicAdd(&coords_grad[i*3+2], -drz_g);
     }
+
+    block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
 }
 
 
@@ -247,39 +267,41 @@ template <typename scalar_t>
 __global__ void cmm_polarization_real_kernel(
     scalar_t* coords,
     scalar_t* g_box,
-    scalar_t* g_box_inv,
-    int32_t* pairs,
+    int64_t* pairs,
     scalar_t* b_elec_ij,
-    int32_t* pairs_excl,
+    int64_t* pairs_excl,
     scalar_t* charges,
     scalar_t* dipoles,
     scalar_t* epot,
     scalar_t* efield,
-    int32_t npairs,
-    int32_t npairs_excl,
+    int64_t npairs,
+    int64_t npairs_excl,
     scalar_t ewald_alpha,
     scalar_t rcut_sr,
     scalar_t rcut_lr
 )
 {
-    // Box
     __shared__ scalar_t box[9];
     __shared__ scalar_t box_inv[9];
     if (threadIdx.x < 9) {
         box[threadIdx.x] = g_box[threadIdx.x];
-        box_inv[threadIdx.x] = g_box_inv[threadIdx.x];
     }
     __syncthreads();
-    int32_t start = threadIdx.x + blockDim.x * blockIdx.x;
-    for (int32_t index = start; index < npairs; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs[index * 2];
-        int32_t j = pairs[index * 2 + 1];
+    if (threadIdx.x == 0) {
+        invert_box_3x3<scalar_t>(box, box_inv);
+    }
+    __syncthreads();
+
+    int64_t start = threadIdx.x + blockDim.x * blockIdx.x;
+    for (int64_t index = start; index < npairs; index += gridDim.x * blockDim.x) {
+        int64_t i = pairs[index * 2];
+        int64_t j = pairs[index * 2 + 1];
         if ( i < 0 || j < 0 ) {
             continue;
         }
-        scalar_t rij[3];
-        diff_vec3(coords+j*3, coords+i*3, rij);
-        apply_pbc_triclinic(rij, box, box_inv, rij);
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
         scalar_t dr = norm3d_(rij[0], rij[1], rij[2]);
         if ( dr >= rcut_lr ) { continue; }
 
@@ -311,13 +333,13 @@ __global__ void cmm_polarization_real_kernel(
         atomicAdd(&efield[j*3], edata_j[1]); atomicAdd(&efield[j*3+1], edata_j[2]); atomicAdd(&efield[j*3+2], edata_j[3]);
     }
 
-    for (int32_t index = start; index < npairs_excl; index += gridDim.x * blockDim.x) {
-        int32_t i = pairs_excl[index * 2];
-        int32_t j = pairs_excl[index * 2 + 1];
+    for (int64_t index = start; index < npairs_excl; index += gridDim.x * blockDim.x) {
+        int64_t i = pairs_excl[index * 2];
+        int64_t j = pairs_excl[index * 2 + 1];
 
-        scalar_t rij[3];
-        diff_vec3(coords+j*3, coords+i*3, rij);
-        apply_pbc_triclinic(rij, box, box_inv, rij);
+        scalar_t rij[3], tmp_vec[3];
+        diff_vec3(&coords[j*3], &coords[i*3], tmp_vec);
+        apply_pbc_triclinic(tmp_vec, box, box_inv, rij);
         scalar_t dr = norm3d_(rij[0], rij[1], rij[2]);
 
         scalar_t c0_i = charges[i];
@@ -354,8 +376,8 @@ public:
 
 static at::Tensor forward(
     torch::autograd::AutogradContext* ctx,
-    at::Tensor& dist_vecs, at::Tensor& pairs,
-    at::Tensor& dist_vecs_excl, at::Tensor& pairs_excl,
+    at::Tensor& coords, at::Tensor& box,
+    at::Tensor& pairs, at::Tensor& pairs_excl,
     at::Tensor& induced_multipoles,
     at::Tensor& b_elec_ij,
     at::Scalar ewald_alpha,
@@ -364,27 +386,28 @@ static at::Tensor forward(
     at::Scalar natoms
 )
 {
-    int32_t npairs = pairs.size(0);
-    int32_t npairs_excl = pairs_excl.size(0);
-    at::Tensor ene = at::zeros({npairs}, dist_vecs.options());
-    at::Tensor ene_excl = at::zeros({npairs_excl}, dist_vecs_excl.options());
+    int64_t npairs = pairs.size(0);
+    int64_t npairs_excl = pairs_excl.size(0);
 
-    at::Tensor dist_vecs_grad = at::zeros_like(dist_vecs, dist_vecs.options());
-    at::Tensor dist_vecs_excl_grad = at::zeros_like(dist_vecs_excl, dist_vecs_excl.options());
+    auto opts = coords.options();
+    at::Tensor ene = at::zeros({}, opts);
+    at::Tensor coords_grad = at::zeros_like(coords, opts);
 
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t block_dim = 128;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
+    constexpr int BLOCK_SIZE = 128;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (npairs + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    AT_DISPATCH_FLOATING_TYPES(dist_vecs.scalar_type(), "cmm_polarization_energy_from_induced_multipoles_kernel", ([&] {
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "cmm_polarization_energy_from_induced_multipoles_kernel", ([&] {
         scalar_t* charges_ptr = induced_multipoles.data_ptr<scalar_t>();
         scalar_t* dipoles_ptr = charges_ptr + natoms.toInt();
-        cmm_polarization_energy_from_induced_multipoles_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-            dist_vecs.data_ptr<scalar_t>(),
-            pairs.data_ptr<int32_t>(),
-            dist_vecs_excl.data_ptr<scalar_t>(),
-            pairs_excl.data_ptr<int32_t>(),
+        cmm_polarization_energy_from_induced_multipoles_kernel<scalar_t, BLOCK_SIZE><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
+            coords.data_ptr<scalar_t>(),
+            box.data_ptr<scalar_t>(),
+            pairs.data_ptr<int64_t>(),
+            pairs_excl.data_ptr<int64_t>(),
             charges_ptr,
             dipoles_ptr,
             b_elec_ij.data_ptr<scalar_t>(),
@@ -393,15 +416,13 @@ static at::Tensor forward(
             static_cast<scalar_t>(rcut_sr.toDouble()),
             static_cast<scalar_t>(rcut_lr.toDouble()),
             ene.data_ptr<scalar_t>(),
-            ene_excl.data_ptr<scalar_t>(),
-            dist_vecs_grad.data_ptr<scalar_t>(),
-            dist_vecs_excl_grad.data_ptr<scalar_t>()
+            coords_grad.data_ptr<scalar_t>()
         );
     }));
     
-    ctx->save_for_backward({dist_vecs_grad, dist_vecs_excl_grad});
+    ctx->save_for_backward({coords_grad});
 
-    return at::sum(ene)+at::sum(ene_excl);
+    return ene;
 }
 
 static std::vector<at::Tensor> backward(
@@ -413,10 +434,16 @@ static std::vector<at::Tensor> backward(
 
     at::Tensor ignore;
     return {
-        saved[0]*grad_outputs[0], ignore,
-        saved[1]*grad_outputs[0], ignore,
-        ignore, ignore, ignore, 
-        ignore, ignore, ignore
+        saved[0]*grad_outputs[0], // coords grad
+        ignore, // box
+        ignore, // pairs
+        ignore, // pairs_excl
+        ignore, // induced_multipoles
+        ignore, // b_elec_ij
+        ignore, // ewald_alpha
+        ignore, // rcut_sr
+        ignore, // rcut_lr
+        ignore  // natoms
     };
 }
 
@@ -424,8 +451,8 @@ static std::vector<at::Tensor> backward(
 
 
 at::Tensor cmm_polarization_energy_from_induced_multipoles_cuda(
-    at::Tensor& dist_vecs, at::Tensor& pairs,
-    at::Tensor& dist_vecs_excl, at::Tensor& pairs_excl,
+    at::Tensor& coords, at::Tensor& box,
+    at::Tensor& pairs, at::Tensor& pairs_excl,
     at::Tensor& induced_multipoles,
     at::Tensor& b_elec_ij,
     at::Scalar ewald_alpha,
@@ -435,7 +462,7 @@ at::Tensor cmm_polarization_energy_from_induced_multipoles_cuda(
 )
 {
     return CMMPolarizationEnergyFromInducedMultipolesFromPairsFunctionCuda::apply(
-        dist_vecs, pairs, dist_vecs_excl, pairs_excl, induced_multipoles, b_elec_ij,
+        coords, box, pairs, pairs_excl, induced_multipoles, b_elec_ij,
         ewald_alpha, rcut_sr, rcut_lr, natoms
     );
 }
@@ -454,34 +481,32 @@ void compute_cmm_polarization_real_space_cuda(
     at::Tensor& vec_out
 )
 {
-    at::Tensor box_inv, ignore;
-    std::tie(box_inv, ignore) = at::linalg_inv_ex(box, false);
-
     auto props = at::cuda::getCurrentDeviceProperties();
     auto stream = at::cuda::getCurrentCUDAStream();
-    int32_t npairs = pairs.size(0);
-    int32_t natoms = coords.size(0);
-    int32_t block_dim = 256;
-    int32_t grid_dim = std::min(props->maxBlocksPerMultiProcessor*props->multiProcessorCount, (npairs+block_dim-1)/block_dim);
+    int64_t npairs = pairs.size(0);
+    int64_t natoms = coords.size(0);
+    constexpr int BLOCK_SIZE = 256;
+    int64_t grid_dim = std::min(
+        static_cast<int64_t>(props->maxBlocksPerMultiProcessor * props->multiProcessorCount),
+        (npairs + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "cmm_polarization_real_kernel", ([&] {
         scalar_t* charges_ptr = vec_in.data_ptr<scalar_t>();
         scalar_t* dipoles_ptr = charges_ptr + natoms;
         scalar_t* epot_ptr = vec_out.data_ptr<scalar_t>();
         scalar_t* efield_ptr = epot_ptr + natoms;
-        cmm_polarization_real_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        cmm_polarization_real_kernel<scalar_t><<<grid_dim, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
             box.data_ptr<scalar_t>(),
-            box_inv.data_ptr<scalar_t>(),
-            pairs.data_ptr<int32_t>(),
+            pairs.data_ptr<int64_t>(),
             b_elec_ij.data_ptr<scalar_t>(),
-            pairs_excl.data_ptr<int32_t>(),
+            pairs_excl.data_ptr<int64_t>(),
             charges_ptr,
             dipoles_ptr,
             epot_ptr,
             efield_ptr,
             npairs, 
-            static_cast<int32_t>(pairs_excl.size(0)),
+            static_cast<int64_t>(pairs_excl.size(0)),
             static_cast<scalar_t>(ewald_alpha.toDouble()),
             static_cast<scalar_t>(rcut_sr.toDouble()),
             static_cast<scalar_t>(rcut_lr.toDouble())
