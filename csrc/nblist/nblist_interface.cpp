@@ -2,13 +2,10 @@
 #include <torch/library.h>
 
 TORCH_LIBRARY_FRAGMENT(torchff, m) {
-    m.def("build_neighbor_list_nsquared(Tensor coords, Tensor box, Scalar cutoff, Scalar max_npairs, bool padding) -> (Tensor, Tensor)");
-    // m.def("build_neighbor_list_cell_list(Tensor coords, Tensor box, Scalar cutoff, Scalar max_npairs, Scalar cell_size, bool padding) -> (Tensor, Tensor)");
-    // m.def("build_neighbor_list_cell_list_shared(Tensor coords, Tensor box, Scalar cutoff, Scalar max_npairs, Scalar cell_size, bool padding) -> (Tensor, Tensor)");
-    // m.def("build_cluster_pairs(Tensor coords, Tensor box, Scalar cutoff, Tensor exclusions, Scalar cell_size, Scalar max_num_interacting_clusters) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
-    // m.def("decode_cluster_pairs(Tensor coords, Tensor box, Tensor sorted_atom_indices, Tensor cluster_exclusions, Tensor bitmask_exclusions, Tensor interacting_clusters, Tensor interacting_atoms, Scalar cutoff, Scalar max_npairs, bool padding) -> (Tensor, Tensor)");
-    // m.def("build_neighbor_list_nnpop(Tensor positions, Scalar cutoff, Scalar max_num_neighbors, Tensor box_vectors, bool checkErrors) -> (Tensor neighbors, Tensor deltas, Tensor distances, Tensor num_pairs)");
-    // m.def("build_neighbor_list_torchmdnet(Tensor positions, Tensor batch, Tensor in_box_size, bool use_periodic, Scalar cutoff_lower, Scalar cutoff_upper, Scalar max_num_pairs, bool loop, bool include_transpose) -> (Tensor, Tensor, Tensor, Tensor)");
+    m.def("build_neighbor_list_nsquared(Tensor coords, Tensor? box, Scalar cutoff, Scalar max_npairs, Tensor? excl_row_ptr, Tensor? excl_col_indices, bool include_self) -> (Tensor, Tensor)");
+    m.def("build_neighbor_list_nsquared_out(Tensor coords, Tensor? box, Scalar cutoff, Tensor(a!) pairs, Tensor? excl_row_ptr, Tensor? excl_col_indices, bool include_self) -> Tensor");
+    m.def("build_neighbor_list_cell_list(Tensor coords, Tensor? box, Scalar cutoff, Scalar max_npairs, Tensor? excl_row_ptr, Tensor? excl_col_indices, bool include_self) -> (Tensor, Tensor)");
+    m.def("build_neighbor_list_cell_list_out(Tensor coords, Tensor? box, Scalar cutoff, Tensor(a!) pairs, Tensor? excl_row_ptr, Tensor? excl_col_indices, bool include_self) -> (Tensor, Tensor)");
 }
 
 PYBIND11_MODULE(torchff_nblist, m) {

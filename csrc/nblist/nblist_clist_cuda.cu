@@ -8,587 +8,524 @@
 
 #include "common/vec3.cuh"
 #include "common/pbc.cuh"
+#include "common/reduce.cuh"
+#include "nblist/exclusions.cuh"
+
+#ifndef WARP_SIZE
+#define WARP_SIZE 32
+#endif
+
+#ifndef NBLIST_CLIST_BLOCK_SIZE
+#define NBLIST_CLIST_BLOCK_SIZE 256
+#endif
+
+#ifndef NBLIST_CLIST_BUFFER_SIZE
+#define NBLIST_CLIST_BUFFER_SIZE 256
+#endif
 
 
-template <typename scalar_t> 
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t dist_from_fractional_coords(
+    scalar_t* fcrd_i, scalar_t* fcrd_j, scalar_t* box
+) {
+    scalar_t dfcrd[3];
+    diff_vec3(fcrd_i, fcrd_j, dfcrd);
+    dfcrd[0] -= round_(dfcrd[0]);
+    dfcrd[1] -= round_(dfcrd[1]);
+    dfcrd[2] -= round_(dfcrd[2]);
+    scalar_t x = dfcrd[0] * box[0] + dfcrd[1] * box[3] + dfcrd[2] * box[6];
+    scalar_t y = dfcrd[0] * box[1] + dfcrd[1] * box[4] + dfcrd[2] * box[7];
+    scalar_t z = dfcrd[0] * box[2] + dfcrd[1] * box[5] + dfcrd[2] * box[8];
+    return norm3d_(x, y, z);
+}
+
+
+// Step 1: Compute fractional coordinates and assign each atom to a cell.
+template <typename scalar_t>
 __global__ void assign_cell_index_kernel(
     scalar_t* coords,
-    scalar_t* box_inv,
-    scalar_t fcrx, scalar_t fcry, scalar_t fcrz, // cell size in fractional coords
-    int32_t ncx, int32_t ncy, int32_t ncz, // number of cells in one dimension
-    int32_t natoms,
+    scalar_t* box,
+    int ncells,
+    int natoms,
     scalar_t* f_coords,
-    int32_t* cell_indices,
-    int32_t* natoms_per_cell
+    int64_t* cell_indices
 )
 {
-    __shared__ scalar_t s_box_inv[9];
-    if ( threadIdx.x < 9 ) {
-        s_box_inv[threadIdx.x] = box_inv[threadIdx.x];
+    __shared__ scalar_t box_inv[9];
+    if (threadIdx.x == 0) {
+        invert_box_3x3<scalar_t>(box, box_inv);
     }
     __syncthreads();
 
-    int32_t index = threadIdx.x + blockIdx.x * blockDim.x;
-    if ( index >= natoms ) {
+    int index = threadIdx.x + blockIdx.x * blockDim.x;
+    if (index >= natoms) {
         return;
     }
 
-    scalar_t crd[3];
-    crd[0] = coords[index * 3];
-    crd[1] = coords[index * 3 + 1];
-    crd[2] = coords[index * 3 + 2];
+    scalar_t rx = coords[index * 3];
+    scalar_t ry = coords[index * 3 + 1];
+    scalar_t rz = coords[index * 3 + 2];
 
-    // compute fractional coords
-    scalar_t fx = dot_vec3(s_box_inv, crd);
-    scalar_t fy = dot_vec3(s_box_inv+3, crd);
-    scalar_t fz = dot_vec3(s_box_inv+6, crd);
+    scalar_t fx = box_inv[0]*rx + box_inv[3]*ry + box_inv[6]*rz; fx -= floor_(fx);
+    scalar_t fy = box_inv[1]*rx + box_inv[4]*ry + box_inv[7]*rz; fy -= floor_(fy);
+    scalar_t fz = box_inv[2]*rx + box_inv[5]*ry + box_inv[8]*rz; fz -= floor_(fz);
 
-    // shift to [0, 1]
-    fx -= floor(fx);
-    fy -= floor(fy);
-    fz -= floor(fz);
-
-    // compute cell index
-    int32_t cx = (int32_t)(fx / fcrx) % ncx;
-    int32_t cy = (int32_t)(fy / fcry) % ncy;
-    int32_t cz = (int32_t)(fz / fcrz) % ncz;
-    int32_t c = (cx * ncy + cy) * ncz + cz;
+    int cx = min(static_cast<int>(fx * ncells), ncells - 1);
+    int cy = min(static_cast<int>(fy * ncells), ncells - 1);
+    int cz = min(static_cast<int>(fz * ncells), ncells - 1);
 
     f_coords[index*3]   = fx;
     f_coords[index*3+1] = fy;
     f_coords[index*3+2] = fz;
 
-    cell_indices[index] = c;
-    atomicAdd(&natoms_per_cell[c+1], 1);
+    cell_indices[index] = cx * ncells * ncells + cy * ncells + cz;
 }
 
 
-__global__ void compute_cell_prefix(int32_t* sorted_cell_indices, int32_t natoms, int32_t* cell_prefix) {
-    int32_t index = threadIdx.x + blockIdx.x * blockDim.x;
-    if ( index >= natoms || index == 0 ) {
-        return;
-    }
-
-    int32_t prev_c = sorted_cell_indices[index - 1];
-    int32_t c = sorted_cell_indices[index];
-    if ( prev_c != c ) {
-        cell_prefix[c] = index;
-    }
-
-}
-
-
+// Step 3: Compute bounding box (center + radius) for each 32-atom cluster
+// in fractional coordinate space.
 template <typename scalar_t>
-__global__ void build_neighbor_list_cell_list_kernel(
-    scalar_t* f_coords_sorted, // fractional coordinates sorted by cell index
-    scalar_t* box,
-    scalar_t cutoff2,
-    scalar_t fcrx, scalar_t fcry, scalar_t fcrz,
-    int32_t ncx, int32_t ncy, int32_t ncz, // number of cells in each dimension
-    int32_t ncr, // number of cells to search in each dimension
-    int32_t* sorted_atom_indices, // sorted_atom_indices[i] is the original index of i-th position in f_coords_sorted
-    int32_t* cell_prefix,
+__global__ void compute_bounding_box_kernel(
+    scalar_t* f_coords_sorted,
     int32_t natoms,
-    int32_t max_npairs,
-    int32_t* pairs,
-    int32_t* npairs
+    scalar_t* cluster_centers,
+    scalar_t* cluster_sizes
 )
 {
-    __shared__ scalar_t s_box[9];
-    if ( threadIdx.x < 9 ) {
-        s_box[threadIdx.x] = box[threadIdx.x];
+    int32_t totalWarps = blockDim.x * gridDim.x / WARP_SIZE;
+    int32_t warpIdx = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int32_t idxInWarp = threadIdx.x & (WARP_SIZE - 1);
+
+    int32_t nclusters = (natoms + WARP_SIZE - 1) / WARP_SIZE;
+    for (int32_t pos = warpIdx; pos < nclusters; pos += totalWarps) {
+        scalar_t crd[3] = {0.0, 0.0, 0.0};
+
+        int32_t i = pos * WARP_SIZE + idxInWarp;
+        if (i < natoms) {
+            crd[0] = f_coords_sorted[i*3];
+            crd[1] = f_coords_sorted[i*3+1];
+            crd[2] = f_coords_sorted[i*3+2];
+        }
+
+        scalar_t anchor[3];
+        anchor[0] = __shfl_sync(0xFFFFFFFFu, crd[0], 0);
+        anchor[1] = __shfl_sync(0xFFFFFFFFu, crd[1], 0);
+        anchor[2] = __shfl_sync(0xFFFFFFFFu, crd[2], 0);
+
+        diff_vec3(crd, anchor, crd);
+        crd[0] -= round_(crd[0]);
+        crd[1] -= round_(crd[1]);
+        crd[2] -= round_(crd[2]);
+
+        scalar_t mincrd[3] = {1.0, 1.0, 1.0};
+        scalar_t maxcrd[3] = {-1.0, -1.0, -1.0};
+
+        if (i < natoms) {
+            mincrd[0] = maxcrd[0] = crd[0];
+            mincrd[1] = maxcrd[1] = crd[1];
+            mincrd[2] = maxcrd[2] = crd[2];
+        }
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            mincrd[0] = min_(mincrd[0], __shfl_down_sync(0xFFFFFFFFu, mincrd[0], offset));
+            mincrd[1] = min_(mincrd[1], __shfl_down_sync(0xFFFFFFFFu, mincrd[1], offset));
+            mincrd[2] = min_(mincrd[2], __shfl_down_sync(0xFFFFFFFFu, mincrd[2], offset));
+            maxcrd[0] = max_(maxcrd[0], __shfl_down_sync(0xFFFFFFFFu, maxcrd[0], offset));
+            maxcrd[1] = max_(maxcrd[1], __shfl_down_sync(0xFFFFFFFFu, maxcrd[1], offset));
+            maxcrd[2] = max_(maxcrd[2], __shfl_down_sync(0xFFFFFFFFu, maxcrd[2], offset));
+        }
+        if (idxInWarp == 0) {
+            cluster_centers[pos*3]   = (mincrd[0] + maxcrd[0]) / 2 + anchor[0];
+            cluster_centers[pos*3+1] = (mincrd[1] + maxcrd[1]) / 2 + anchor[1];
+            cluster_centers[pos*3+2] = (mincrd[2] + maxcrd[2]) / 2 + anchor[2];
+            scalar_t bbx = (maxcrd[0] - mincrd[0]) / 2;
+            scalar_t bby = (maxcrd[1] - mincrd[1]) / 2;
+            scalar_t bbz = (maxcrd[2] - mincrd[2]) / 2;
+            cluster_sizes[pos] = norm3d_(bbx, bby, bbz);
+        }
+    }
+}
+
+
+// Step 4: Find pairs of clusters whose bounding spheres overlap within
+// the fractional-space cutoff.
+template <typename scalar_t>
+__global__ void find_interacting_clusters_kernel(
+    scalar_t* cluster_centers,
+    scalar_t* cluster_sizes,
+    int nclusters,
+    scalar_t* box,
+    scalar_t cutoff,
+    int32_t* interacting_clusters,
+    int32_t* num_interacting_clusters,
+    int64_t max_interacting_clusters
+)
+{
+    __shared__ scalar_t s_f_cutoff;
+    if (threadIdx.x == 0) {
+        scalar_t a = norm3d_(box[0], box[1], box[2]);
+        scalar_t b = norm3d_(box[3], box[4], box[5]);
+        scalar_t c = norm3d_(box[6], box[7], box[8]);
+        s_f_cutoff = cutoff / min_(a, min_(b, c));
     }
     __syncthreads();
 
-    int32_t index = threadIdx.x + blockIdx.x * blockDim.x;
+    scalar_t f_cutoff = s_f_cutoff;
+    int idxInWarp = threadIdx.x & (WARP_SIZE - 1);
 
-    if ( index >= natoms ) {
-        return;
-    }
+    int64_t nclusters_int64 = (int64_t)nclusters;
+    int64_t maxv = nclusters_int64 * (nclusters_int64 + 1) / 2;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+    int64_t maxv_padded = ((maxv + stride - 1) / stride) * stride;
 
-    scalar_t fcrd_i[3];
-    fcrd_i[0] = f_coords_sorted[index*3];
-    fcrd_i[1] = f_coords_sorted[index*3+1];
-    fcrd_i[2] = f_coords_sorted[index*3+2];
-    int32_t i = sorted_atom_indices[index];
+    for (int64_t index = threadIdx.x + blockIdx.x * blockDim.x;
+         index < maxv_padded;
+         index += stride) {
 
-    int32_t cx = (int32_t)(fcrd_i[0] / fcrx) % ncx;
-    int32_t cy = (int32_t)(fcrd_i[1] / fcry) % ncy;
-    int32_t cz = (int32_t)(fcrd_i[2] / fcrz) % ncz;
+        bool include = false;
+        int64_t ci = 0, cj = 0;
 
-    scalar_t fcrd_j[3];
-    scalar_t dfcrd[3];
-    scalar_t dcrd[3];
+        if (index < maxv) {
+            ci = (int64_t)floor((sqrt(((double)index) * 8 + 1) - 1) / 2);
+            cj = index - (ci * (ci + 1)) / 2;
 
-    scalar_t tmp[3];
-    int32_t nei_cx, nei_cy, nei_cz, nei_c, i_curr_pair;
-    // Loop over neighbor cells
-    for (int32_t dcx = -ncr; dcx <= ncr; ++dcx) {
-        nei_cx = (cx + dcx + ncx) % ncx;
-        for (int32_t dcy = -ncr; dcy <= ncr; ++dcy) {
-            nei_cy = (cy + dcy + ncy) % ncy;
-            for (int32_t dcz = -ncr; dcz <= ncr; ++dcz) {
-                nei_cz = (cz + dcz + ncz) % ncz;
-                nei_c = (nei_cx * ncy + nei_cy) * ncz + nei_cz;
-                for (int32_t j_sort = cell_prefix[nei_c]; j_sort < cell_prefix[nei_c+1]; ++j_sort) {
-                    if ( index > j_sort ) {
-                        fcrd_j[0] = f_coords_sorted[j_sort*3];
-                        fcrd_j[1] = f_coords_sorted[j_sort*3+1];
-                        fcrd_j[2] = f_coords_sorted[j_sort*3+2];
-                        diff_vec3(fcrd_i, fcrd_j, dfcrd);
-                        dfcrd[0] -= round(dfcrd[0]);
-                        dfcrd[1] -= round(dfcrd[1]);
-                        dfcrd[2] -= round(dfcrd[2]);
+            if (ci == cj) {
+                include = true;
+            } else {
+                scalar_t dr[3];
+                diff_vec3(&cluster_centers[ci*3], &cluster_centers[cj*3], dr);
+                dr[0] -= round_(dr[0]);
+                dr[1] -= round_(dr[1]);
+                dr[2] -= round_(dr[2]);
+                scalar_t dist = norm3d_(dr[0], dr[1], dr[2]);
+                scalar_t cri = cluster_sizes[ci];
+                scalar_t crj = cluster_sizes[cj];
+                include = (dist <= cri + crj + f_cutoff);
+            }
+        }
 
-                        dcrd[0] = dot_vec3(dfcrd, s_box);
-                        dcrd[1] = dot_vec3(dfcrd, s_box+3);
-                        dcrd[2] = dot_vec3(dfcrd, s_box+6);
-
-                        if ( (dcrd[0] * dcrd[0] + dcrd[1] * dcrd[1] + dcrd[2] * dcrd[2]) <= cutoff2 ) {
-                            i_curr_pair = atomicAdd(npairs, 1) % max_npairs;
-                            pairs[i_curr_pair*2] = i;
-                            pairs[i_curr_pair*2+1] = sorted_atom_indices[j_sort];
-                        }
-                    }
-                }
+        int rank, count;
+        count_true_values_in_warp(include, rank, count, idxInWarp);
+        if (count > 0) {
+            int start = 0;
+            if (idxInWarp == 0) {
+                start = atomicAdd(num_interacting_clusters, count);
+            }
+            start = __shfl_sync(0xFFFFFFFFu, start, 0);
+            int start_idx = start + rank;
+            if (include && start_idx < max_interacting_clusters) {
+                interacting_clusters[start_idx * 2] = (int32_t)ci;
+                interacting_clusters[start_idx * 2 + 1] = (int32_t)cj;
             }
         }
     }
 }
+
+
+// Step 5: For each interacting cluster pair, compute pairwise distances
+// using warp shuffles (32x32) and emit valid neighbor pairs.
+template <typename scalar_t, int BUFFER_SIZE, int BLOCK_SIZE>
+__global__ void build_neighbor_list_cell_list_kernel(
+    scalar_t* f_coords_sorted,
+    scalar_t* g_box,
+    scalar_t cutoff,
+    int64_t* sorted_atom_indices,
+    int32_t* interacting_blocks,
+    const int32_t* num_interacting_ptr,
+    int64_t natoms,
+    int64_t max_npairs,
+    int64_t* pairs,
+    int32_t* npairs,
+    const int64_t* excl_row_ptr,
+    const int64_t* excl_col_indices,
+    bool include_self
+)
+{
+    __shared__ scalar_t box[9];
+    __shared__ int32_t s_num_interacting;
+    if (threadIdx.x < 9) {
+        box[threadIdx.x] = g_box[threadIdx.x];
+    }
+    if (threadIdx.x == 0) {
+        s_num_interacting = *num_interacting_ptr;
+    }
+    __syncthreads();
+
+    int32_t num_interacting = s_num_interacting;
+    int32_t warpIdxInBlock = threadIdx.x / WARP_SIZE;
+    int32_t idxInWarp = threadIdx.x & (WARP_SIZE - 1);
+    int32_t totalWarps = (BLOCK_SIZE / WARP_SIZE) * gridDim.x;
+    int32_t warpIdx = blockIdx.x * (BLOCK_SIZE / WARP_SIZE) + warpIdxInBlock;
+
+    __shared__ int64_t pairs_buffer[BUFFER_SIZE * 2 * (BLOCK_SIZE / WARP_SIZE)];
+    int64_t* my_buffer = pairs_buffer + warpIdxInBlock * BUFFER_SIZE * 2;
+    int curr_buffer_size = 0;
+
+    for (int32_t blk = warpIdx; blk < num_interacting; blk += totalWarps) {
+        int32_t cx = interacting_blocks[blk * 2];
+        int32_t cy = interacting_blocks[blk * 2 + 1];
+
+        int64_t idx_i = (int64_t)cx * WARP_SIZE + idxInWarp;
+        scalar_t fcrd_i[3] = {0.0, 0.0, 0.0};
+        int64_t atom_i = -1;
+        if (idx_i < natoms) {
+            fcrd_i[0] = f_coords_sorted[idx_i*3];
+            fcrd_i[1] = f_coords_sorted[idx_i*3+1];
+            fcrd_i[2] = f_coords_sorted[idx_i*3+2];
+            atom_i = sorted_atom_indices[idx_i];
+        }
+
+        if (cx == cy) {
+            // Diagonal block: compare atoms within the same cluster.
+            for (int32_t srcLane = 0; srcLane < WARP_SIZE; ++srcLane) {
+                scalar_t fcrd_src[3];
+                fcrd_src[0] = __shfl_sync(0xFFFFFFFFu, fcrd_i[0], srcLane);
+                fcrd_src[1] = __shfl_sync(0xFFFFFFFFu, fcrd_i[1], srcLane);
+                fcrd_src[2] = __shfl_sync(0xFFFFFFFFu, fcrd_i[2], srcLane);
+                int64_t atom_src = __shfl_sync(0xFFFFFFFFu, atom_i, srcLane);
+
+                bool valid = false;
+                if (atom_i >= 0 && atom_src >= 0) {
+                    if (atom_i == atom_src) {
+                        valid = include_self;
+                    } else if (atom_i > atom_src) {
+                        scalar_t dr = dist_from_fractional_coords(fcrd_i, fcrd_src, box);
+                        if (dr <= cutoff && !is_excluded_csr(atom_i, atom_src, excl_row_ptr, excl_col_indices)) {
+                            valid = true;
+                        }
+                    }
+                }
+
+                int rank, count;
+                count_true_values_in_warp(valid, rank, count, idxInWarp);
+                if (count > 0) {
+                    int buf_idx = curr_buffer_size + rank;
+                    if (valid) {
+                        int64_t a = atom_i, b = atom_src;
+                        if (a == b) { /* self-pair */ }
+                        else if (a < b) { int64_t t = a; a = b; b = t; }
+                        my_buffer[buf_idx * 2] = a;
+                        my_buffer[buf_idx * 2 + 1] = b;
+                    }
+                    curr_buffer_size += count;
+                    flush_warp_buffer<int64_t, int64_t,2, BUFFER_SIZE, WARP_SIZE>(
+                        my_buffer, curr_buffer_size, pairs, npairs, max_npairs, idxInWarp, false);
+                }
+            }
+        } else {
+            // Off-diagonal block: compare atoms from cluster cx vs cluster cy.
+            int64_t idx_j = (int64_t)cy * WARP_SIZE + idxInWarp;
+            scalar_t fcrd_j[3] = {0.0, 0.0, 0.0};
+            int64_t atom_j = -1;
+            if (idx_j < natoms) {
+                fcrd_j[0] = f_coords_sorted[idx_j*3];
+                fcrd_j[1] = f_coords_sorted[idx_j*3+1];
+                fcrd_j[2] = f_coords_sorted[idx_j*3+2];
+                atom_j = sorted_atom_indices[idx_j];
+            }
+
+            for (int32_t srcLane = 0; srcLane < WARP_SIZE; ++srcLane) {
+                scalar_t fcrd_src[3];
+                fcrd_src[0] = __shfl_sync(0xFFFFFFFFu, fcrd_i[0], srcLane);
+                fcrd_src[1] = __shfl_sync(0xFFFFFFFFu, fcrd_i[1], srcLane);
+                fcrd_src[2] = __shfl_sync(0xFFFFFFFFu, fcrd_i[2], srcLane);
+                int64_t atom_src = __shfl_sync(0xFFFFFFFFu, atom_i, srcLane);
+
+                bool valid = false;
+                if (atom_src >= 0 && atom_j >= 0) {
+                    scalar_t dr = dist_from_fractional_coords(fcrd_j, fcrd_src, box);
+                    if (dr <= cutoff && !is_excluded_csr(atom_j, atom_src, excl_row_ptr, excl_col_indices)) {
+                        valid = true;
+                    }
+                }
+
+                int rank, count;
+                count_true_values_in_warp(valid, rank, count, idxInWarp);
+                if (count > 0) {
+                    int buf_idx = curr_buffer_size + rank;
+                    if (valid) {
+                        int64_t a = atom_src, b = atom_j;
+                        if (a < b) { int64_t t = a; a = b; b = t; }
+                        my_buffer[buf_idx * 2] = a;
+                        my_buffer[buf_idx * 2 + 1] = b;
+                    }
+                    curr_buffer_size += count;
+                    flush_warp_buffer<int64_t, int64_t, 2, BUFFER_SIZE, WARP_SIZE>(
+                        my_buffer, curr_buffer_size, pairs, npairs, max_npairs, idxInWarp, false);
+                }
+            }
+        }
+    }
+
+    flush_warp_buffer<int64_t, int64_t, 2, BUFFER_SIZE, WARP_SIZE>(
+        my_buffer, curr_buffer_size, pairs, npairs, max_npairs, idxInWarp, true);
+}
+
+
+// Forward declaration
+std::tuple<at::Tensor, at::Tensor> build_neighbor_list_cell_list_out_cuda(
+    const at::Tensor& coords,
+    const c10::optional<at::Tensor> box,
+    const at::Scalar& cutoff,
+    at::Tensor pairs,
+    c10::optional<at::Tensor> excl_row_ptr,
+    c10::optional<at::Tensor> excl_col_indices,
+    bool include_self
+);
 
 
 std::tuple<at::Tensor, at::Tensor> build_neighbor_list_cell_list_cuda(
     const at::Tensor& coords,
-    const at::Tensor& box,
+    const c10::optional<at::Tensor> box,
     const at::Scalar& cutoff,
     const at::Scalar& max_npairs,
-    const at::Scalar& cell_size,
-    bool padding
+    c10::optional<at::Tensor> excl_row_ptr,
+    c10::optional<at::Tensor> excl_col_indices,
+    bool include_self
 )
 {
-    at::Tensor box_inv = at::linalg_inv(box);
-    int32_t natoms = coords.size(0);
-
-    int32_t max_npairs_ = max_npairs.toInt();
-    max_npairs_ = ( max_npairs_ == -1 ) ? natoms * (natoms - 1) / 2 : max_npairs_;
-
-    at::Tensor box_cpu = box.to(at::kCPU);
-    at::Tensor box_len = at::linalg_norm(box_cpu, 2, 0);
-    at::Tensor f_cell_size = cell_size / box_len;
-    at::Tensor nc = at::floor(box_len / cell_size).to(at::kInt);
-
-    int32_t ncx = nc[0].item<int32_t>();
-    int32_t ncy = nc[1].item<int32_t>();
-    int32_t ncz = nc[2].item<int32_t>();
-    int32_t ncr = ceilf(cutoff.toFloat() / cell_size.toFloat());
-
-    TORCH_CHECK(ncx > 2 * ncr, "Box is too small in dimension x");
-    TORCH_CHECK(ncy > 2 * ncr, "Box is too small in dimension y");
-    TORCH_CHECK(ncz > 2 * ncr, "Box is too small in dimension z");
-
-
-    int block_dim = 32;
-    int grid_dim = (natoms + block_dim - 1) / block_dim;
-
-    at::Tensor pairs = at::empty({max_npairs_, 2}, coords.options().dtype(at::kInt));
-    at::Tensor npairs = at::zeros({1}, coords.options().dtype(at::kInt));
-
-    at::Tensor f_coords = at::empty_like(coords);
-    at::Tensor cell_indices = at::empty({natoms}, pairs.options());
-    at::Tensor natoms_per_cell = at::zeros({ncx*ncy*ncz+1}, pairs.options());
-
-    at::Tensor sorted_cell_indices;
-    at::Tensor sorted_atom_indices;
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-
-    // Step 1: Compute fractional coords and assign cell index for each atom
-    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "assign_cell_index", ([&] {
-        scalar_t* fcr = f_cell_size.data_ptr<scalar_t>();
-        scalar_t fcrx = fcr[0];
-        scalar_t fcry = fcr[1];
-        scalar_t fcrz = fcr[2];
-        assign_cell_index_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-            coords.data_ptr<scalar_t>(),
-            box_inv.data_ptr<scalar_t>(),
-            fcrx, fcry, fcrz,
-            ncx, ncy, ncz,
-            natoms,
-            f_coords.data_ptr<scalar_t>(),
-            cell_indices.data_ptr<int32_t>(),
-            natoms_per_cell.data_ptr<int32_t>()
-        );
-    }));
-
-    // Step 2: Sort atoms according to cell indices
-    std::tie(sorted_cell_indices, sorted_atom_indices) = at::sort(cell_indices);
-    at::Tensor f_coords_sorted = f_coords.index_select(0, sorted_atom_indices);
-
-    // Step 3: Compute prefix (cumsum of number of atoms in each cell)
-    at::Tensor cell_prefix = at::cumsum(natoms_per_cell, 0).to(at::kInt);
-    // std::cout << "Cell prefix:" << cell_prefix << std::endl; 
-    
-    // Step 4: Do neighbor list search
-    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "build_neighbor_list", ([&] {
-        scalar_t* fcr = f_cell_size.data_ptr<scalar_t>();
-        scalar_t fcrx = fcr[0];
-        scalar_t fcry = fcr[1];
-        scalar_t fcrz = fcr[2];
-        scalar_t cutoff2 = static_cast<scalar_t>(cutoff.toDouble() * cutoff.toDouble());
-        build_neighbor_list_cell_list_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-            f_coords_sorted.data_ptr<scalar_t>(),
-            box.data_ptr<scalar_t>(),
-            cutoff2,
-            fcrx, fcry, fcrz,
-            ncx, ncy, ncz,
-            ncr,
-            sorted_atom_indices.to(at::kInt).data_ptr<int32_t>(),
-            cell_prefix.data_ptr<int32_t>(),
-            natoms,
-            max_npairs_,
-            pairs.data_ptr<int32_t>(),
-            npairs.data_ptr<int32_t>()
-        );
-    }));
-    
-    if ( !padding ) {
-        cudaError_t err = cudaGetLastError();
-        TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
-
-        // check if the number of pairs exceeds the capacity
-        int32_t npairs_found = npairs[0].item<int32_t>();
-        TORCH_CHECK(npairs_found <= max_npairs_, "Too many neighbor pairs found. Maximum is " + std::to_string(max_npairs_), " but found " + std::to_string(npairs_found));
-        return std::make_tuple(pairs.index({at::indexing::Slice(0, npairs_found), at::indexing::Slice()}), npairs);
-
-    }
-    else {
-        return std::make_tuple(pairs, npairs);
-    }
-
+    int64_t natoms = coords.size(0);
+    int64_t max_npairs_ = (max_npairs.toLong() < 0) ? natoms * (natoms + 1) / 2 : max_npairs.toLong();
+    at::Tensor pairs = at::empty({max_npairs_, 2}, coords.options().dtype(at::kLong));
+    return build_neighbor_list_cell_list_out_cuda(
+        coords, box, cutoff, pairs, excl_row_ptr, excl_col_indices, include_self
+    );
 }
 
 
-__device__ __forceinline__ void unravel_3d(int32_t c, int32_t nx, int32_t ny, int32_t nz, int32_t& x, int32_t& y, int32_t& z) {
-    x = c / (ny * nz);
-    y = c / nz - x * ny;
-    z = c % nz;
-}
-
-__device__ __forceinline__ int32_t warp_dist(int32_t a, int32_t b, int32_t n) {
-    int32_t d = abs(a - b);
-    return min(d, n - d);
-}
-
-__device__ __forceinline__ bool is_interact(int32_t start_cidx_i, int32_t end_cidx_i, int32_t start_cidx_j, int32_t end_cidx_j, int32_t ncx, int32_t ncy, int32_t ncz, int32_t ncr) {
-    int32_t cx_i, cy_i, cz_i;
-    int32_t cx_j, cy_j, cz_j;
-    bool interact = false;
-
-    for (int32_t ci = start_cidx_i; ci <= end_cidx_i; ++ci) {
-        if ( interact ) { break; }
-        unravel_3d(ci, ncx, ncy, ncz, cx_i, cy_i, cz_i);
-        for (int32_t cj = start_cidx_j; cj <= end_cidx_j; ++cj) {
-            unravel_3d(cj, ncx, ncy, ncz, cx_j, cy_j, cz_j);
-            interact = warp_dist(cx_i, cx_j, ncx) <= ncr && warp_dist(cy_i, cy_j, ncy) <= ncr && warp_dist(cz_i, cz_j, ncz) <= ncr;
-            if ( interact ) { break; }
-        }
-    }
-    return interact;
-}
-
-
-template <typename scalar_t>
-__global__ void find_interacting_blocks(
-    int32_t* sorted_cell_indices,
-    int32_t num_blocks,
-    int32_t ncx, int32_t ncy, int32_t ncz,
-    int32_t ncr,
-    int32_t* interacting_blocks,
-    int32_t* num_interacting_blocks
-)
-{
-    int32_t index = threadIdx.x + blockIdx.x * blockDim.x;
-    if ( index >= num_blocks * (num_blocks + 1) / 2 ) {
-        return;
-    }
-    int32_t i = (int32_t)floor((sqrt(((double)index) * 8 + 1) - 1) / 2);
-    // if (i * (i - 1) > 2 * index) i--;
-    int32_t j = index - (i * (i + 1)) / 2;
-
-    int32_t n;
-
-    // n = atomicAdd(num_interacting_blocks, 1);
-    // interacting_blocks[n * 2] = i;
-    // interacting_blocks[n * 2 + 1] = j;
-
-    if ( i == j ) {
-        n = atomicAdd(num_interacting_blocks, 1);
-        interacting_blocks[n * 2] = i;
-        interacting_blocks[n * 2 + 1] = j;
-    }
-    else {
-        int32_t start_cidx_i = sorted_cell_indices[i * 32];
-        int32_t start_cidx_j = sorted_cell_indices[j * 32];
-        int32_t end_cidx_i = (i == num_blocks - 1) ? ncx * ncy * ncz - 1: sorted_cell_indices[i * 32 + 31];
-        int32_t end_cidx_j = (j == num_blocks - 1) ? ncx * ncy * ncz - 1: sorted_cell_indices[j * 32 + 31];
-        if ( is_interact(start_cidx_i, end_cidx_i, start_cidx_j, end_cidx_j, ncx, ncy, ncz, ncr) ) {
-            n = atomicAdd(num_interacting_blocks, 1);
-            interacting_blocks[n * 2] = i;
-            interacting_blocks[n * 2 + 1] = j;
-        }
-    }
-}
-
-
-template <typename scalar_t>
-__global__ void build_neighbor_list_cell_list_shared_kernel(
-    scalar_t* f_coords_sorted, // fractional coordinates sorted by cell index
-    scalar_t* box,
-    scalar_t cutoff2,
-    int32_t* sorted_atom_indices, // sorted_atom_indices[i] is the original index of i-th position in f_coords_sorted
-    int32_t* interacting_blocks,
-    int32_t natoms,
-    int32_t max_npairs,
-    int32_t* pairs,
-    int32_t* npairs
-)
-{
-    // Load box into shared memory
-    __shared__ scalar_t s_box[9];
-
-    if ( threadIdx.x < 9 ) {
-        s_box[threadIdx.x] = box[threadIdx.x];
-    }
-    __syncthreads();
-
-    // Indices of two interacting blocks
-    int32_t x = interacting_blocks[blockIdx.x * 2];
-    int32_t y = interacting_blocks[blockIdx.x * 2 + 1];
-    scalar_t fcrd_i[3] = {0.0, 0.0, 0.0};
-    scalar_t fcrd_j[3] = {0.0, 0.0, 0.0};
-    scalar_t fcrd_i_shfl[3] = {0.0, 0.0, 0.0};
-    scalar_t dfcrd[3];
-    scalar_t dcrd[3];
-
-    int32_t i = -1;
-    int32_t j = -1;
-    int32_t i_shfl = -1;
-    int32_t i_curr_pair;
-
-    int32_t index_i = x * 32 + threadIdx.x;
-    int32_t index_j = y * 32 + threadIdx.x;
-    if ( index_i < natoms ) {
-        fcrd_i[0] = f_coords_sorted[index_i*3];
-        fcrd_i[1] = f_coords_sorted[index_i*3+1];
-        fcrd_i[2] = f_coords_sorted[index_i*3+2];
-        i = sorted_atom_indices[index_i];
-    }
-
-    // Diagnonal blocks
-    if ( x == y ) {
-        for (int32_t srcLane = 0; srcLane < 32; ++srcLane) {
-            fcrd_i_shfl[0] = __shfl_sync(0xFFFFFFFFu, fcrd_i[0], srcLane);
-            fcrd_i_shfl[1] = __shfl_sync(0xFFFFFFFFu, fcrd_i[1], srcLane);
-            fcrd_i_shfl[2] = __shfl_sync(0xFFFFFFFFu, fcrd_i[2], srcLane);
-            i_shfl = __shfl_sync(0xFFFFFFFFu, i, srcLane);
-
-            if ( i != -1 && i_shfl != -1 && i > i_shfl ) {
-                // printf("Thread %d Check between %d and %d from lane %d\n", threadIdx.x, i, j, srcLane);
-                // diff
-                diff_vec3(fcrd_i, fcrd_i_shfl, dfcrd);
-                // apply pbc
-                dfcrd[0] -= round(dfcrd[0]);
-                dfcrd[1] -= round(dfcrd[1]);
-                dfcrd[2] -= round(dfcrd[2]);
-                // compute
-                dcrd[0] = dot_vec3(dfcrd, s_box);
-                dcrd[1] = dot_vec3(dfcrd, s_box+3);
-                dcrd[2] = dot_vec3(dfcrd, s_box+6);
-        
-                if ( (dcrd[0] * dcrd[0] + dcrd[1] * dcrd[1] + dcrd[2] * dcrd[2]) <= cutoff2 ) {
-                    i_curr_pair = atomicAdd(npairs, 1) % max_npairs;
-                    pairs[i_curr_pair*2] = i;
-                    pairs[i_curr_pair*2+1] = i_shfl;
-                }
-            }
-        }
-    }
-    else {
-        if ( index_j < natoms ) {
-            j = sorted_atom_indices[index_j];
-            fcrd_j[0] = f_coords_sorted[index_j*3];
-            fcrd_j[1] = f_coords_sorted[index_j*3+1];
-            fcrd_j[2] = f_coords_sorted[index_j*3+2];
-        }
-
-        for (int32_t srcLane = 0; srcLane < 32; ++srcLane) {
-            fcrd_i_shfl[0] = __shfl_sync(0xFFFFFFFFu, fcrd_i[0], srcLane);
-            fcrd_i_shfl[1] = __shfl_sync(0xFFFFFFFFu, fcrd_i[1], srcLane);
-            fcrd_i_shfl[2] = __shfl_sync(0xFFFFFFFFu, fcrd_i[2], srcLane);
-            i_shfl = __shfl_sync(0xFFFFFFFFu, i, srcLane);
-            if ( i_shfl != -1 && j != -1 ) {
-                // diff
-                diff_vec3(fcrd_j, fcrd_i_shfl, dfcrd);
-                // apply pbc
-                dfcrd[0] -= round(dfcrd[0]);
-                dfcrd[1] -= round(dfcrd[1]);
-                dfcrd[2] -= round(dfcrd[2]);
-                // compute
-                dcrd[0] = dot_vec3(dfcrd, s_box);
-                dcrd[1] = dot_vec3(dfcrd, s_box+3);
-                dcrd[2] = dot_vec3(dfcrd, s_box+6);
-        
-                if ( (dcrd[0] * dcrd[0] + dcrd[1] * dcrd[1] + dcrd[2] * dcrd[2]) <= cutoff2 ) {
-                    i_curr_pair = atomicAdd(npairs, 1) % max_npairs;
-                    pairs[i_curr_pair*2] = i_shfl;
-                    pairs[i_curr_pair*2+1] = j;
-                }
-            }
-        }
-    }
-}
-
-
-std::tuple<at::Tensor, at::Tensor> build_neighbor_list_cell_list_shared_cuda(
+std::tuple<at::Tensor, at::Tensor> build_neighbor_list_cell_list_out_cuda(
     const at::Tensor& coords,
-    const at::Tensor& box,
+    const c10::optional<at::Tensor> box,
     const at::Scalar& cutoff,
-    const at::Scalar& max_npairs,
-    const at::Scalar& cell_size,
-    bool padding
+    at::Tensor pairs,
+    c10::optional<at::Tensor> excl_row_ptr,
+    c10::optional<at::Tensor> excl_col_indices,
+    bool include_self
 )
 {
+    TORCH_CHECK(box.has_value() && box.value().defined(),
+                "Cell-list neighbor list requires a periodic box");
 
-#ifdef DEBUG
-    std::chrono::duration<double> diff;
-    auto start_time_prep = std::chrono::steady_clock::now();
-#endif
+    int64_t natoms = coords.size(0);
+    int64_t max_npairs_ = pairs.size(0);
 
-    at::Tensor box_inv = at::linalg_inv(box);
-    int32_t natoms = coords.size(0);
+    pairs.fill_(-1);
 
-    int32_t max_npairs_ = max_npairs.toInt();
-    max_npairs_ = ( max_npairs_ == -1 ) ? natoms * (natoms - 1) / 2 : max_npairs_;
+    const int64_t* row_ptr = (excl_row_ptr.has_value() && excl_row_ptr.value().defined())
+        ? excl_row_ptr.value().data_ptr<int64_t>() : nullptr;
+    const int64_t* col_ind = (excl_col_indices.has_value() && excl_col_indices.value().defined())
+        ? excl_col_indices.value().data_ptr<int64_t>() : nullptr;
 
-    at::Tensor box_cpu = box.to(at::kCPU);
-    at::Tensor box_len = at::linalg_norm(box_cpu, 2, 0);
-    at::Tensor f_cell_size = cell_size / box_len;
-    at::Tensor nc = at::floor(box_len / cell_size).to(at::kInt);
-
-    int32_t ncx = nc[0].item<int32_t>();
-    int32_t ncy = nc[1].item<int32_t>();
-    int32_t ncz = nc[2].item<int32_t>();
-    int32_t ncr = (int32_t)ceilf(cutoff.toFloat() / cell_size.toFloat());
-
-    TORCH_CHECK(ncx > 2 * ncr, "Box is too small in dimension x");
-    TORCH_CHECK(ncy > 2 * ncr, "Box is too small in dimension y");
-    TORCH_CHECK(ncz > 2 * ncr, "Box is too small in dimension z");
-
-    at::Tensor pairs = at::empty({max_npairs_, 2}, coords.options().dtype(at::kInt));
-    at::Tensor npairs = at::zeros({1}, coords.options().dtype(at::kInt));
+    int32_t ncells = std::max(1, (int32_t)std::cbrt(static_cast<double>(natoms / WARP_SIZE)));
+    int32_t nclusters = (natoms + WARP_SIZE - 1) / WARP_SIZE;
+    int64_t max_interacting = std::min<int64_t>(max_npairs_, (int64_t)nclusters * (nclusters + 1) / 2);
+    // (int64_t)nclusters * (nclusters + 1) / 2;
 
     at::Tensor f_coords = at::empty_like(coords);
-    at::Tensor cell_indices = at::empty({natoms}, pairs.options());
-    at::Tensor natoms_per_cell = at::zeros({ncx*ncy*ncz+1}, pairs.options());
+    at::Tensor cell_indices = at::empty({natoms}, coords.options().dtype(at::kLong));
+    at::Tensor npairs = at::zeros({1}, coords.options().dtype(at::kInt));
 
-    at::Tensor sorted_cell_indices;
-    at::Tensor sorted_atom_indices;
+    at::Tensor cluster_centers = at::empty({nclusters, 3}, coords.options());
+    at::Tensor cluster_sizes = at::empty({nclusters}, coords.options());
 
-    int32_t num_blocks = (natoms + 31) / 32;
     at::Tensor num_interacting_blocks = at::zeros({1}, coords.options().dtype(at::kInt));
-    at::Tensor interacting_blocks = at::empty({num_blocks * (num_blocks + 1) / 2, 2}, coords.options().dtype(at::kInt));
-
-#ifdef DEBUG
-    auto end_time_prep = std::chrono::steady_clock::now();
-    diff = end_time_prep - start_time_prep;
-    std::cout << "Prep time: " << diff.count() * 1000 << " ms" << std::endl;
-#endif
+    at::Tensor interacting_blocks = at::full({max_interacting, 2}, -1, coords.options().dtype(at::kInt));
 
     auto stream = at::cuda::getCurrentCUDAStream();
+    auto props = at::cuda::getCurrentDeviceProperties();
 
-    // Step 1: Compute fractional coords and assign cell index for each atom
-    int block_dim = 128;
-    int grid_dim = (natoms + block_dim - 1) / block_dim;
+    // Step 1: Compute fractional coords and assign cell indices
+    constexpr int STEP1_BLOCK_SIZE = 256;
+    int STEP1_GRID_SIZE = (natoms + STEP1_BLOCK_SIZE - 1) / STEP1_BLOCK_SIZE;
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "assign_cell_index", ([&] {
-        scalar_t* fcr = f_cell_size.data_ptr<scalar_t>();
-        scalar_t fcrx = fcr[0];
-        scalar_t fcry = fcr[1];
-        scalar_t fcrz = fcr[2];
-        assign_cell_index_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        assign_cell_index_kernel<scalar_t><<<STEP1_GRID_SIZE, STEP1_BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
-            box_inv.data_ptr<scalar_t>(),
-            fcrx, fcry, fcrz,
-            ncx, ncy, ncz,
-            natoms,
+            box.value().data_ptr<scalar_t>(),
+            ncells,
+            (int)natoms,
             f_coords.data_ptr<scalar_t>(),
-            cell_indices.data_ptr<int32_t>(),
-            natoms_per_cell.data_ptr<int32_t>()
+            cell_indices.data_ptr<int64_t>()
         );
     }));
 
-    // Step 2: Sort atoms according to cell indices
-    std::tie(sorted_cell_indices, sorted_atom_indices) = at::sort(cell_indices);
-    at::Tensor f_coords_sorted = f_coords.index_select(0, sorted_atom_indices);
+    // Step 2: Sort atoms by cell index for spatial coherence
+    at::Tensor sorted_cell_indices, sort_perm;
+    std::tie(sorted_cell_indices, sort_perm) = at::sort(cell_indices);
+    at::Tensor f_coords_sorted = f_coords.index_select(0, sort_perm);
+    at::Tensor sorted_atom_indices = sort_perm;
 
-    // Step 3: Find interacting blocks, each block contains 32 atoms
-    grid_dim = (num_blocks * (num_blocks + 1) / 2 + block_dim - 1) / block_dim;
-    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "find_interacting_blocks", ([&] {
-        find_interacting_blocks<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-            sorted_cell_indices.data_ptr<int32_t>(),
-            num_blocks,
-            ncx, ncy, ncz,
-            ncr,
-            interacting_blocks.data_ptr<int32_t>(),
-            num_interacting_blocks.data_ptr<int32_t>()
-        );
-    }));
-    
-    // Step 4: Process interacting blocks to build neighbor list
-    block_dim = 32;
-    grid_dim = num_interacting_blocks.to(at::kCPU).item().toInt();
-    // std::cout << "Num interacting blocks: " << grid_dim << std::endl;
-
-    // std::chrono::duration<double> diff;
-    // auto start_time_build = std::chrono::steady_clock::now();
-
-    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "build_neighbor_list", ([&] {
-        scalar_t cutoff2 = static_cast<scalar_t>(cutoff.toDouble() * cutoff.toDouble());
-        build_neighbor_list_cell_list_shared_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+    // Step 3: Compute bounding boxes for each 32-atom cluster
+    constexpr int STEP3_BLOCK_SIZE = 256;
+    int STEP3_GRID_SIZE = std::min(
+        (int)((nclusters * WARP_SIZE + STEP3_BLOCK_SIZE - 1) / STEP3_BLOCK_SIZE),
+        props->maxBlocksPerMultiProcessor * props->multiProcessorCount
+    );
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_bounding_box", ([&] {
+        compute_bounding_box_kernel<scalar_t><<<STEP3_GRID_SIZE, STEP3_BLOCK_SIZE, 0, stream>>>(
             f_coords_sorted.data_ptr<scalar_t>(),
-            box.data_ptr<scalar_t>(),
-            cutoff2,
-            sorted_atom_indices.to(at::kInt).data_ptr<int32_t>(),
-            interacting_blocks.data_ptr<int32_t>(),
-            natoms,
-            max_npairs_,
-            pairs.data_ptr<int32_t>(),
-            npairs.data_ptr<int32_t>()
+            (int32_t)natoms,
+            cluster_centers.data_ptr<scalar_t>(),
+            cluster_sizes.data_ptr<scalar_t>()
         );
     }));
 
-    // cudaDeviceSynchronize();
-    // auto end_time_build = std::chrono::steady_clock::now();
-    // diff = end_time_build - start_time_build;
-    // std::cout << "Build time: " << diff.count() * 1000 << " ms" << std::endl;
-    
-    if ( !padding ) {
-        cudaError_t err = cudaGetLastError();
-        TORCH_CHECK(err == cudaSuccess, "CUDA kernel failed: ", cudaGetErrorString(err));
+    // Step 4: Find interacting cluster pairs
+    int32_t STEP4_BLOCK_SIZE_val = NBLIST_CLIST_BLOCK_SIZE;
+    int32_t STEP4_GRID_SIZE = std::min(
+        (int)((max_interacting + STEP4_BLOCK_SIZE_val - 1) / STEP4_BLOCK_SIZE_val),
+        props->maxBlocksPerMultiProcessor * props->multiProcessorCount
+    );
+    AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "find_interacting_clusters", ([&] {
+        scalar_t cutoff_val = static_cast<scalar_t>(cutoff.toDouble());
+        find_interacting_clusters_kernel<scalar_t><<<STEP4_GRID_SIZE, STEP4_BLOCK_SIZE_val, 0, stream>>>(
+            cluster_centers.data_ptr<scalar_t>(),
+            cluster_sizes.data_ptr<scalar_t>(),
+            nclusters,
+            box.value().data_ptr<scalar_t>(),
+            cutoff_val,
+            interacting_blocks.data_ptr<int32_t>(),
+            num_interacting_blocks.data_ptr<int32_t>(),
+            max_interacting
+        );
+    }));
 
-        // check if the number of pairs exceeds the capacity
-        int32_t npairs_found = npairs[0].item<int32_t>();
-        TORCH_CHECK(npairs_found <= max_npairs_, "Too many neighbor pairs found. Maximum is " + std::to_string(max_npairs_), " but found " + std::to_string(npairs_found));
-        return std::make_tuple(pairs.index({at::indexing::Slice(0, npairs_found), at::indexing::Slice()}), npairs);
-
+    // Step 5: Build atom-pair neighbor list from interacting cluster pairs.
+    // Use max_interacting (host-computable) for the grid size to avoid a
+    // device-to-host sync that would break CUDA graph capture.  The actual
+    // count is read from num_interacting_blocks inside the kernel.
+    if (max_interacting > 0) {
+        int64_t warps_per_block = NBLIST_CLIST_BLOCK_SIZE / WARP_SIZE;
+        int64_t needed_blocks = (max_interacting + warps_per_block - 1) / warps_per_block;
+        int32_t STEP5_GRID_SIZE = (int32_t)std::min(
+            needed_blocks,
+            (int64_t)(props->maxBlocksPerMultiProcessor * props->multiProcessorCount)
+        );
+        AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "build_neighbor_list_cell_list", ([&] {
+            scalar_t cutoff_val = static_cast<scalar_t>(cutoff.toDouble());
+            build_neighbor_list_cell_list_kernel<scalar_t, NBLIST_CLIST_BUFFER_SIZE, NBLIST_CLIST_BLOCK_SIZE>
+                <<<STEP5_GRID_SIZE, NBLIST_CLIST_BLOCK_SIZE, 0, stream>>>(
+                f_coords_sorted.data_ptr<scalar_t>(),
+                box.value().data_ptr<scalar_t>(),
+                cutoff_val,
+                sorted_atom_indices.data_ptr<int64_t>(),
+                interacting_blocks.data_ptr<int32_t>(),
+                num_interacting_blocks.data_ptr<int32_t>(),
+                natoms,
+                max_npairs_,
+                pairs.data_ptr<int64_t>(),
+                npairs.data_ptr<int32_t>(),
+                row_ptr,
+                col_ind,
+                include_self
+            );
+        }));
     }
-    else {
-        return std::make_tuple(pairs, npairs);
-    }
 
+    return std::make_tuple(pairs, npairs);
 }
 
 
 TORCH_LIBRARY_IMPL(torchff, CUDA, m) {
     m.impl("build_neighbor_list_cell_list", build_neighbor_list_cell_list_cuda);
-    m.impl("build_neighbor_list_cell_list_shared", build_neighbor_list_cell_list_shared_cuda);
+    m.impl("build_neighbor_list_cell_list_out", build_neighbor_list_cell_list_out_cuda);
 }
