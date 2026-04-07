@@ -26,7 +26,10 @@ __global__ void harmonic_bond_cuda_kernel(
     scalar_t* k_grad,
     scalar_t sign
 ) {
-    
+    if ( ene_out && threadIdx.x == 0 && blockIdx.x == 0 ) {
+        ene_out[0] = scalar_t(0.0);
+    }
+    __syncthreads();
     scalar_t ene = scalar_t(0.0);
     for (int index = threadIdx.x+blockIdx.x*BLOCK_SIZE; index < nbonds; index += BLOCK_SIZE*gridDim.x) {
         int offset = index * 2;
@@ -93,10 +96,10 @@ public:
             props->multiProcessorCount*props->maxBlocksPerMultiProcessor
         );
 
-        at::Tensor ene_out = at::zeros({1}, coords.options());
+        at::Tensor ene_out = at::empty({}, coords.options());
         at::Tensor coord_grad = at::zeros_like(coords, coords.options());
-        at::Tensor b0_grad = at::zeros_like(b0, b0.options());
-        at::Tensor k_grad = at::zeros_like(k, k.options());
+        at::Tensor b0_grad = at::empty_like(b0, b0.options());
+        at::Tensor k_grad = at::empty_like(k, k.options());
         ctx->save_for_backward({coord_grad, b0_grad, k_grad});
 
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_bond_cuda", ([&] {
