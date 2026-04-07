@@ -9,23 +9,29 @@
 #include <cuda_runtime.h>
 
 #include "common/vec3.cuh"
+#include "common/reduce.cuh"
 
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void periodic_torsion_cuda_kernel(
-    scalar_t* coords, 
-    int64_t* torsions, 
-    scalar_t* fc, 
-    int64_t* periodicity, 
-    scalar_t* phase, 
+    scalar_t* coords,
+    int64_t* torsions,
+    scalar_t* fc,
+    int64_t* periodicity,
+    scalar_t* phase,
     int64_t ntors,
-    scalar_t* ene, 
-    scalar_t* coord_grad, 
-    scalar_t* fc_grad, 
+    scalar_t* ene_out,
+    scalar_t* coord_grad,
+    scalar_t* fc_grad,
     scalar_t* phase_grad,
     scalar_t sign
 ) {
-    for (int index = threadIdx.x+blockIdx.x*blockDim.x; index < ntors; index += blockDim.x*gridDim.x) {
+    if (ene_out && threadIdx.x == 0 && blockIdx.x == 0) {
+        ene_out[0] = scalar_t(0.0);
+    }
+    __syncthreads();
+    scalar_t ene = scalar_t(0.0);
+    for (int index = threadIdx.x + blockIdx.x * BLOCK_SIZE; index < ntors; index += BLOCK_SIZE * gridDim.x) {
         int offset = index * 4;
         int64_t offset_i = 3 * torsions[offset];
         int64_t offset_j = 3 * torsions[offset + 1];
@@ -68,10 +74,10 @@ __global__ void periodic_torsion_cuda_kernel(
         scalar_t tmp1 = 1 + cos_(phi);
         scalar_t tmp2 = k * sin_(phi);
 
-        if ( ene ) {
-            ene[index] = k * tmp1;
+        if (ene_out) {
+            ene += k * tmp1;
         }
-        
+
         if (coord_grad) {
             scalar_t prefactor = tmp2 * n * sign;
 
@@ -97,7 +103,10 @@ __global__ void periodic_torsion_cuda_kernel(
         }
         if ( phase_grad ) {
             phase_grad[index] = tmp2;
-        }   
+        }
+    }
+    if (ene_out) {
+        block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
     }
 }
 
@@ -124,20 +133,20 @@ public:
             props->multiProcessorCount*props->maxBlocksPerMultiProcessor
         );
 
-        at::Tensor ene = at::zeros({ntors}, coords.options());
+        at::Tensor ene_out = at::empty({}, coords.options());
         at::Tensor coord_grad = at::zeros_like(coords, coords.options());
-        at::Tensor fc_grad = at::zeros_like(fc, fc.options());
-        at::Tensor phase_grad = at::zeros_like(phase, phase.options());
+        at::Tensor fc_grad = at::empty_like(fc, fc.options());
+        at::Tensor phase_grad = at::empty_like(phase, phase.options());
 
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_periodic_torsion_cuda", ([&] {
-            periodic_torsion_cuda_kernel<scalar_t><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
+            periodic_torsion_cuda_kernel<scalar_t, BLOCK_SIZE><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
                 coords.data_ptr<scalar_t>(),
                 torsions.data_ptr<int64_t>(),
                 fc.data_ptr<scalar_t>(),
                 periodicity.data_ptr<int64_t>(),
                 phase.data_ptr<scalar_t>(),
                 ntors,
-                ene.data_ptr<scalar_t>(),
+                ene_out.data_ptr<scalar_t>(),
                 (coords.requires_grad()) ? coord_grad.data_ptr<scalar_t>() : nullptr,
                 (fc.requires_grad()) ? fc_grad.data_ptr<scalar_t>() : nullptr,
                 (phase.requires_grad()) ? phase_grad.data_ptr<scalar_t>(): nullptr,
@@ -145,7 +154,7 @@ public:
             );
         }));
         ctx->save_for_backward({coord_grad, fc_grad, phase_grad});
-        return at::sum(ene);
+        return ene_out;
     }
 
     static std::vector<at::Tensor> backward(
@@ -190,7 +199,7 @@ void compute_periodic_torsion_forces_cuda(
     );
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_periodic_torsion_forces_cuda", ([&] {
-        periodic_torsion_cuda_kernel<scalar_t><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
+        periodic_torsion_cuda_kernel<scalar_t, BLOCK_SIZE><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
             torsions.data_ptr<int64_t>(),
             fc.data_ptr<scalar_t>(),

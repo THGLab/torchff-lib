@@ -9,21 +9,27 @@
 #include <cuda_runtime.h>
 
 #include "common/vec3.cuh"
+#include "common/reduce.cuh"
 
-template <typename scalar_t>
+template <typename scalar_t, int BLOCK_SIZE>
 __global__ void harmonic_angle_cuda_kernel(
-    scalar_t* coords, 
-    int64_t* angles, 
-    scalar_t* theta0, 
-    scalar_t* k, 
+    scalar_t* coords,
+    int64_t* angles,
+    scalar_t* theta0,
+    scalar_t* k,
     int64_t nangles,
-    scalar_t* ene,
-    scalar_t* coord_grad, 
-    scalar_t* theta0_grad, 
+    scalar_t* ene_out,
+    scalar_t* coord_grad,
+    scalar_t* theta0_grad,
     scalar_t* k_grad,
     scalar_t sign
 ) {
-    for (int index = threadIdx.x+blockIdx.x*blockDim.x; index < nangles; index += blockDim.x*gridDim.x) {
+    if ( ene_out && threadIdx.x == 0 && blockIdx.x == 0 ) {
+        ene_out[0] = scalar_t(0.0);
+    }
+    __syncthreads();
+    scalar_t ene = scalar_t(0.0);
+    for (int index = threadIdx.x+blockIdx.x*BLOCK_SIZE; index < nangles; index += BLOCK_SIZE*gridDim.x) {
         int64_t offset = index * 3;
         int64_t offset_0 = angles[offset] * 3;
         int64_t offset_1 = angles[offset + 1] * 3;
@@ -51,13 +57,13 @@ __global__ void harmonic_angle_cuda_kernel(
         scalar_t k_ = k[index];
         scalar_t dtheta = theta - theta0[index];
     
-        if ( ene ) {
-            ene[index] = k_ * dtheta * dtheta / 2;
+        if ( ene_out ) {
+            ene += k_ * dtheta * dtheta / 2;
         }
 
-        if ( coord_grad ) {   
+        if ( coord_grad ) {
 
-            scalar_t dtheta_dcos = -1 / sqrt_(1 - cos_theta * cos_theta);
+            scalar_t dtheta_dcos = -scalar_t(1.0) / sqrt_(scalar_t(1.0) - cos_theta * cos_theta);
             scalar_t prefix = k_ * dtheta * dtheta_dcos / (v1_norm * v2_norm) * sign;
         
             scalar_t g1x = prefix * (v2x - cos_theta * v1x / v1_norm * v2_norm);
@@ -89,6 +95,9 @@ __global__ void harmonic_angle_cuda_kernel(
             theta0_grad[index] = -k_ * dtheta;
         }
     }
+    if ( ene_out ) {
+        block_reduce_sum<scalar_t, BLOCK_SIZE>(ene, ene_out);
+    }
 }
 
 
@@ -114,27 +123,27 @@ public:
             props->multiProcessorCount*props->maxBlocksPerMultiProcessor
         );
 
-        at::Tensor e = at::zeros({nangles}, coords.options());
+        at::Tensor ene_out = at::empty({}, coords.options());
         at::Tensor coord_grad = at::zeros_like(coords, coords.options());
-        at::Tensor theta0_grad = at::zeros_like(theta0, theta0.options());
-        at::Tensor k_grad = at::zeros_like(k, k.options());
+        at::Tensor theta0_grad = at::empty_like(theta0, theta0.options());
+        at::Tensor k_grad = at::empty_like(k, k.options());
+        ctx->save_for_backward({coord_grad, theta0_grad, k_grad});
 
         AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_angle_cuda", ([&] {
-            harmonic_angle_cuda_kernel<scalar_t><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
+            harmonic_angle_cuda_kernel<scalar_t, BLOCK_SIZE><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
                 coords.data_ptr<scalar_t>(),
                 angles.data_ptr<int64_t>(),
                 theta0.data_ptr<scalar_t>(),
                 k.data_ptr<scalar_t>(),
                 nangles,
-                e.data_ptr<scalar_t>(),
+                ene_out.data_ptr<scalar_t>(),
                 (coords.requires_grad()) ? coord_grad.data_ptr<scalar_t>() : nullptr,
                 (theta0.requires_grad()) ? theta0_grad.data_ptr<scalar_t>() : nullptr,
                 (k.requires_grad()) ? k_grad.data_ptr<scalar_t>() : nullptr,
                 static_cast<scalar_t>(1.0)
             );
         }));
-        ctx->save_for_backward({coord_grad, theta0_grad, k_grad});
-        return at::sum(e);
+        return ene_out;
     }
 
     static std::vector<at::Tensor> backward(
@@ -179,7 +188,7 @@ void compute_harmonic_angle_forces_cuda(
     );
 
     AT_DISPATCH_FLOATING_TYPES(coords.scalar_type(), "compute_harmonic_angle_forces_cuda", ([&] {
-        harmonic_angle_cuda_kernel<scalar_t><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
+        harmonic_angle_cuda_kernel<scalar_t, BLOCK_SIZE><<<GRID_SIZE, BLOCK_SIZE, 0, stream>>>(
             coords.data_ptr<scalar_t>(),
             angles.data_ptr<int64_t>(),
             theta0.data_ptr<scalar_t>(),
