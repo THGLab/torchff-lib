@@ -52,6 +52,8 @@ class PBC(nn.Module):
         """
         box = box if box is not None else getattr(self, "box", None)
         box_inv = box_inv if box_inv is not None else getattr(self, "box_inv", None)
+        if box is not None and box_inv is None:
+            box_inv, _ = torch.linalg.inv_ex(box)
         if box is None or box_inv is None:
             return dr_vecs
         ds_vecs = torch.matmul(dr_vecs, box_inv)
@@ -85,4 +87,11 @@ def applyPBC(
     torch.Tensor
         PBC-folded vectors in Cartesian, shape (N, 3).
     """
-    return PBC()(dr_vecs, box, box_inv)
+    if box is not None and box_inv is None:
+        box_inv, _ = torch.linalg.inv_ex(box)
+    if box is None or box_inv is None:
+        return dr_vecs
+    ds_vecs = torch.matmul(dr_vecs, box_inv)
+    ds_vecs_pbc = ds_vecs - torch.floor(ds_vecs + 0.5)
+    dr_vecs_pbc = torch.matmul(ds_vecs_pbc, box)
+    return dr_vecs_pbc
