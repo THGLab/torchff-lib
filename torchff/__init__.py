@@ -3,5 +3,7 @@ from .angle import *
 from .coulomb import *
 from .torsion import *
 from .vdw import *
+from .dispersion import *
+from .slater import *
 from .nblist import *
 from .nonbonded import *
