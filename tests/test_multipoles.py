@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from .utils import check_op, perf_op
+from torchff.test_utils import check_op, perf_op
 from torchff.multipoles import MultipolarInteraction
 
 
@@ -16,17 +16,20 @@ def create_test_data(
     dtype: torch.dtype = torch.float64,
     cutoff: float = 9.0,
     ewald_alpha: float = -1.0,
+    random_state: int | None = 42,
 ):
     """Create random test data for multipolar interaction tests."""
     box_len = float((num * 10.0) ** (1.0 / 3.0))
 
-    coords_np = np.random.rand(num, 3) * box_len
-    q_np = np.random.randn(num) * 0.1
-    d_np = np.random.randn(num, 3) * 0.1
+    rng = np.random.RandomState(random_state) if random_state is not None else np.random
+
+    coords_np = rng.rand(num, 3) * box_len
+    q_np = rng.randn(num) * 0.1
+    d_np = rng.randn(num, 3) * 0.1
 
     t_np = np.empty((num, 3, 3), dtype=float)
     for i in range(num):
-        A = np.random.randn(3, 3)
+        A = rng.randn(3, 3)
         sym = 0.5 * (A + A.T)
         trace = np.trace(sym) / 3.0
         sym -= np.eye(3) * trace
@@ -67,40 +70,63 @@ def create_test_data(
     return coords, box, pairs, q, p, t, cutoff, ewald_alpha, prefactor
 
 
-@pytest.mark.dependency()
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
 @pytest.mark.parametrize("rank", [0, 1, 2])
-def test_multipolar_energy(device, dtype, rank):
+@pytest.mark.parametrize("ewald, excl", [(-1.0, False), (0.4, True), (0.4, False)])
+@pytest.mark.parametrize("cuda_graph", [True, False])
+@pytest.mark.parametrize("return_fields", [True, False])
+def test_multipolar(device, dtype, rank, ewald, excl, cuda_graph, return_fields):
     """Compare custom CUDA multipolar kernel against Python reference implementation."""
     N = 200
     coords, box, pairs, q, p, t, cutoff, ewald_alpha, prefactor = create_test_data(
-        N, rank, device=device, dtype=dtype
+        N, rank, device=device, dtype=dtype, ewald_alpha=ewald
     )
+    if excl:
+        pairs_excl = torch.tensor([[i % N, (i + 1) % N] for i in range(N)], device=device, dtype=pairs.dtype)
+    else:
+        pairs_excl = None
 
     func = MultipolarInteraction(
-        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=True
+        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=True, return_fields=return_fields
     ).to(device=device, dtype=dtype)
     func_ref = MultipolarInteraction(
-        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=False, cuda_graph_compat=False
+        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=False, cuda_graph_compat=cuda_graph,
+        return_fields=return_fields
     ).to(device=device, dtype=dtype)
 
-    # rank=2 sums many pair energies; CUDA parallel reduction order can differ from Python
-    # sequential sum, so allow slightly larger tolerance for quadrupoles
-    atol = 1e-6 if dtype is torch.float64 else 1e-4
-    rtol = 0.0
-    if rank == 2:
-        atol = max(atol, 1e-2)
-        rtol = 1e-4
+    def _ref(coords, box, pairs, q, p, t, pairs_excl):
+        ret = func_ref(coords, box, pairs, q, p, t, pairs_excl)
+        if isinstance(ret, tuple):
+            total = ret[0] + torch.sum(ret[1] ** 2)
+            if rank >= 1:
+                total += torch.sum(ret[2] ** 2)
+            return total
+        else:
+            return ret
+    
+    def _prb(coords, box, pairs, q, p, t, pairs_excl):
+        ret = func(coords, box, pairs, q, p, t, pairs_excl)
+        if isinstance(ret, tuple):
+            total = ret[0] + torch.sum(ret[1] ** 2)
+            if rank >= 1:
+                total += torch.sum(ret[2] ** 2)
+            return total
+        else:
+            return ret
+
     check_op(
-        func,
-        func_ref,
-        {"coords": coords, "box": box, "pairs": pairs, "q": q, "p": p, "t": t},
-        check_grad=True,
-        atol=atol,
-        rtol=rtol,
+        _ref,
+        _prb,
+        {"coords": coords, "box": box, "pairs": pairs, "q": q, "p": p, "t": t, "pairs_excl": pairs_excl},
+        check_func=True if dtype is torch.float64 else False,
+        check_grad=True if dtype is torch.float64 else False,
+        atol=1e-6,
+        rtol=1e-6,
+        verbose=False
     )
 
 
+@pytest.mark.performance
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
 @pytest.mark.parametrize("rank", [0, 1, 2])
 def test_perf_multipolar(device, dtype, rank):
@@ -145,33 +171,3 @@ def test_perf_multipolar(device, dtype, rank):
         run_backward=True,
     )
 
-
-@pytest.mark.dependency()
-@pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
-@pytest.mark.parametrize("rank", [0, 1, 2])
-def test_multipolar_energy_ewald(device, dtype, rank):
-    """Compare custom CUDA vs Python reference when ewald_alpha > 0 (erfc damping)."""
-    N = 200
-    coords, box, pairs, q, p, t, cutoff, ewald_alpha, prefactor = create_test_data(
-        N, rank, device=device, dtype=dtype, ewald_alpha=0.4
-    )
-
-    func = MultipolarInteraction(
-        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=True
-    ).to(device=device, dtype=dtype)
-    func_ref = MultipolarInteraction(
-        rank, cutoff, ewald_alpha, prefactor, use_customized_ops=False, cuda_graph_compat=False
-    ).to(device=device, dtype=dtype)
-
-    atol = 1e-5 if dtype is torch.float64 else 1e-3
-    rtol = 1e-4
-    if rank == 2:
-        atol = max(atol, 1e-2)
-    check_op(
-        func,
-        func_ref,
-        {"coords": coords, "box": box, "pairs": pairs, "q": q, "p": p, "t": t},
-        check_grad=True,
-        atol=atol,
-        rtol=rtol,
-    )

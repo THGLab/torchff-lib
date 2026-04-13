@@ -13,7 +13,9 @@ def computeInteractionTensor(drVec: torch.Tensor, dampFactors: Optional[torch.Te
         drInv = 1 / torch.norm(drVec, dim=1)
     
     if rank == 0:
-        return drInv if dampFactors is None else drInv * dampFactors[0]
+        # For rank-0, dampFactors (if present) is a per-pair vector (erfc(b r)).
+        # We should apply it elementwise, not index it as if it were a stacked tensor.
+        return drInv if dampFactors is None else drInv * dampFactors
     
     # calculate inversions
     drInv2 = drInv * drInv
@@ -95,7 +97,7 @@ def computeInteractionTensor(drVec: torch.Tensor, dampFactors: Optional[torch.Te
         tyz,   -txyz, -tyyz, -tzzy, txxyz, tyyxz, tzzxy, tyyyz, tyyzz, tzzzy,
         tzz,   -tzzx, -tzzy, -tzzz, txxzz, tzzxy, tzzzx, tyyzz, tzzzy, tzzzz
     )).T.reshape(-1, 10, 10)
-    
+
 
 def computeDampFactorsErfc(dr: torch.Tensor, b: float, rank: int):
     u = b * dr
@@ -175,6 +177,7 @@ class MultipolarInteraction(nn.Module):
         cutoff: float,
         ewald_alpha: float = -1.0,
         prefactor: float = 1.0,
+        return_fields: bool = False,
         use_customized_ops: bool = True,
         cuda_graph_compat: bool = True,
     ):
@@ -183,21 +186,20 @@ class MultipolarInteraction(nn.Module):
         self.cutoff = cutoff
         self.ewald_alpha = ewald_alpha
         self.prefactor = prefactor
+        self.return_fields = return_fields
         self.use_customized_ops = use_customized_ops
         if not use_customized_ops:
             self.pbc = PBC()
             self.packer = MultipolePacker(rank=rank)
             self.cuda_graph_compat = cuda_graph_compat
 
-    def forward(self, coords, box, pairs, q, p=None, t=None):
+    def forward(self, coords, box, pairs, q, p=None, t=None, pairs_excl=None):
         if self.use_customized_ops:
-            return self._forward_cpp(coords, box, pairs, q, p, t)
+            return self._forward_cpp(coords, box, pairs, q, p, t, pairs_excl)
         else:
-            return self._forward_python(coords, box, pairs, q, p, t)
+            return self._forward_python(coords, box, pairs, q, p, t, pairs_excl)
 
-    def _forward_python(self, coords, box, pairs, q, p=None, t=None):
-        
-        box_inv, _ = torch.linalg.inv_ex(box)
+    def _forward_python_from_packed_multipoles(self, coords, box, box_inv, multipoles, pairs, is_excl=False):
         dr_vecs = self.pbc(coords[pairs[:, 1]] - coords[pairs[:, 0]], box, box_inv)
         dr = torch.norm(dr_vecs, dim=1, keepdim=False)
 
@@ -206,30 +208,106 @@ class MultipolarInteraction(nn.Module):
             pairs = pairs[mask]
             dr_vecs = dr_vecs[mask]
             dr = dr[mask]
+
+        if self.ewald_alpha >= 0:
+            damps = computeDampFactorsErfc(dr, self.ewald_alpha, rank=self.rank)
+            if is_excl:
+                damps = damps - 1.0
+            i_tensor = computeInteractionTensor(dr_vecs, damps, 1.0/dr, rank=self.rank)
+        else:
+            i_tensor = computeInteractionTensor(dr_vecs, None, 1.0/dr, rank=self.rank)
         
-        if self.rank == 0:
-            if self.ewald_alpha >= 0:
-                ene_pairs = q[pairs[:, 0]] * q[pairs[:, 1]] / dr * computeDampFactorsErfc(dr, self.ewald_alpha, rank=self.rank)
+        if ( not self.return_fields ):
+            if self.rank == 0:
+                # For monopoles, i_tensor already includes any Ewald damping (when ewald_alpha >= 0),
+                # so we should not multiply by damps again here.
+                ene_pairs = multipoles[pairs[:, 0]] * multipoles[pairs[:, 1]] * i_tensor
             else:
-                ene_pairs = q[pairs[:, 0]] * q[pairs[:, 1]] / dr
-        else:
-            if self.ewald_alpha >= 0:
-                damps = computeDampFactorsErfc(dr, self.ewald_alpha, rank=self.rank)
-                i_tensor = computeInteractionTensor(dr_vecs, damps, 1.0/dr, rank=self.rank)
+                m_j = multipoles[pairs[:, 1]]
+                m_i = multipoles[pairs[:, 0]]
+                ene_pairs = torch.bmm(m_j.unsqueeze(1), torch.bmm(i_tensor, m_i.unsqueeze(2))).squeeze(-1).squeeze(-1)
+            
+            if self.cuda_graph_compat:
+                return self.prefactor * torch.sum(ene_pairs * mask)
             else:
-                i_tensor = computeInteractionTensor(dr_vecs, None, 1.0/dr, rank=self.rank)
-            multipoles = self.packer(q, p, t)
-            m_j = multipoles[pairs[:, 1]]
-            m_i = multipoles[pairs[:, 0]]
-            ene_pairs = torch.bmm(m_j.unsqueeze(1), torch.bmm(i_tensor, m_i.unsqueeze(2)))
-
-        if self.cuda_graph_compat:
-            return self.prefactor * torch.sum(ene_pairs * mask)
+                return self.prefactor * torch.sum(ene_pairs)
         else:
-            return self.prefactor * torch.sum(ene_pairs)
+            N = coords.shape[0]
+            device = coords.device
+            dtype = coords.dtype
+            if self.rank == 0:
+                epot = torch.zeros(N, device=device, dtype=dtype)
+                if self.cuda_graph_compat:
+                    epot.scatter_add_(0, pairs[:, 0], (multipoles[pairs[:, 1]] * i_tensor) * mask)
+                    epot.scatter_add_(0, pairs[:, 1], (multipoles[pairs[:, 0]] * i_tensor) * mask)
+                else:
+                    epot.scatter_add_(0, pairs[:, 0], multipoles[pairs[:, 1]] * i_tensor)
+                    epot.scatter_add_(0, pairs[:, 1], multipoles[pairs[:, 0]] * i_tensor)
+                epot *= self.prefactor
+                return torch.sum(epot * multipoles) / 2, epot, None
+            else:
+                m_j = multipoles[pairs[:, 1]]
+                m_i = multipoles[pairs[:, 0]]
+                n_edata = 4 if self.rank == 1 else 10
+                edata_ij = torch.bmm(i_tensor, m_i.unsqueeze(2)).squeeze(2)
+                i_tensor_ji = i_tensor.permute(0, 2, 1)
+                edata_ji = torch.bmm(i_tensor_ji, m_j.unsqueeze(2)).squeeze(2)
+                edata = torch.zeros(N, n_edata, device=device, dtype=dtype)
+                if self.cuda_graph_compat:
+                    # Scatter masked contributions so invalid pairs add zero
+                    mask_expand = mask.unsqueeze(1).expand(-1, n_edata)
+                    edata.scatter_add_(0, pairs[:, 1].unsqueeze(1).expand(-1, n_edata), edata_ij * mask_expand)
+                    edata.scatter_add_(0, pairs[:, 0].unsqueeze(1).expand(-1, n_edata), edata_ji * mask_expand)
+                else:
+                    edata.scatter_add_(0, pairs[:, 1].unsqueeze(1).expand(-1, n_edata), edata_ij)
+                    edata.scatter_add_(0, pairs[:, 0].unsqueeze(1).expand(-1, n_edata), edata_ji)
+                edata *= self.prefactor
+                epot = edata[:, 0]
+                efield = -edata[:, 1:4]
+                energy = torch.sum(edata * multipoles) / 2
+                return energy, epot, efield
 
-    def _forward_cpp(self, coords, box, pairs, q, p=None, t=None):
+    def _forward_python(self, coords, box, pairs, q, p=None, t=None, pairs_excl=None):
+        box_inv, _ = torch.linalg.inv_ex(box)
+        multipoles = self.packer(q, p, t)
+        if pairs_excl is None or self.ewald_alpha <= 0:
+            return self._forward_python_from_packed_multipoles(coords, box, box_inv, multipoles, pairs)
+        else:
+            # With exclusions and Ewald (\( \alpha > 0 \)), combine the regular and
+            # exclusion contributions. The return type depends on whether fields are
+            # requested:
+            # - return_fields == False: scalar energy
+            # - return_fields == True: (energy, epot, efield)
+            ret = self._forward_python_from_packed_multipoles(
+                coords, box, box_inv, multipoles, pairs
+            )
+            ret_excl = self._forward_python_from_packed_multipoles(
+                coords, box, box_inv, multipoles, pairs_excl, True
+            )
+
+            if not self.return_fields:
+                # Both calls returned scalar energies.
+                return ret + ret_excl
+
+            # Both calls returned (energy, epot, efield).
+            energy = ret[0] + ret_excl[0]
+            epot = ret[1] + ret_excl[1]
+            if self.rank == 0:
+                efield = None
+            else:
+                efield = ret[2] + ret_excl[2]
+            return energy, epot, efield
+
+    def _forward_cpp(self, coords, box, pairs, q, p=None, t=None, pairs_excl=None):
+        # pairs_excl is only effective when ewald_alpha > 0; when None or ewald_alpha <= 0
+        # the kernel receives nullptr and npairs_excl=0 (handled in C++/CUDA).
+        if self.return_fields:
+            energy, epot, efield = torch.ops.torchff.compute_multipolar_energy_and_fields_from_atom_pairs(
+                coords, box, pairs, pairs_excl, q, p, t,
+                self.cutoff, self.ewald_alpha, self.prefactor,
+            )
+            return energy, epot, efield
         return torch.ops.torchff.compute_multipolar_energy_from_atom_pairs(
-            coords, box, pairs, q, p, t,
+            coords, box, pairs, pairs_excl, q, p, t,
             self.cutoff, self.ewald_alpha, self.prefactor,
         )

@@ -189,6 +189,9 @@ benchmark/*csv
 benchmark/*png
 benchmark/*.txt
 
+*ncu*
+*nsys*
+
 # nblist variant / experimental implementations (not in build)
 csrc/nblist/nblist_clist_cuda_new.cu
 csrc/nblist/nblist_cluster_pairs_cuda.cu
