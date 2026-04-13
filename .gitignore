@@ -176,5 +176,20 @@ cython_debug/
 .vscode/
 .debug/
 *.backup
+*.legacy
 profile/
 .cursor/
+
+benchmark/torchmd-net/
+benchmark/*nsys*
+benchmark/*ncu*
+benchmark/*sqlite
+benchmark/*pdf
+benchmark/*csv
+benchmark/*png
+benchmark/*.txt
+
+# nblist variant / experimental implementations (not in build)
+csrc/nblist/nblist_clist_cuda_new.cu
+csrc/nblist/nblist_cluster_pairs_cuda.cu
+csrc/nblist/nblist_cluster_pairs_slow_cuda.cu

@@ -19,11 +19,12 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from torchff.angle import AmoebaAngle, HarmonicAngle
+from torchff.angle import AmoebaAngle, Angles, CosineAngle, HarmonicAngle
 from torchff.test_utils import perf_op
 
 DEFAULT_N_VALUES = (1000, 10_000, 100_000, 1_000_000)
@@ -80,8 +81,8 @@ def benchmark_angle_model(
     device = "cuda"
     dtype_s = _dtype_str(dtype)
     coords, angles, theta0, k, na = _angle_tensors(N, device, dtype)
-    func = torch.compile(angle_cls(use_customized_ops=True))
-    func_ref = torch.compile(angle_cls(use_customized_ops=False))
+    func = torch.compile(angle_cls(use_customized_ops=True), mode='max-autotune-no-cudagraphs')
+    func_ref = torch.compile(angle_cls(use_customized_ops=False), mode='max-autotune-no-cudagraphs')
 
     perf_ref = perf_op(
         func_ref,
@@ -153,9 +154,18 @@ def _row_n_angles(r: dict[str, Any]) -> int:
 def plot_angle_benchmark(rows: list[dict[str, Any]], pdf_path: Path) -> None:
     dtype_colors = {"float32": "C0", "float64": "C3"}
     variant_linestyle = {"ref": "--", "torchff": "-"}
-    titles = {"harmonic": "HarmonicAngle", "amoeba": "AmoebaAngle"}
-    fig, (ax_h, ax_a) = plt.subplots(1, 2, figsize=(10, 4.2), constrained_layout=True)
-    for ax, model in ((ax_h, "harmonic"), (ax_a, "amoeba")):
+    titles = {
+        "harmonic": "HarmonicAngle",
+        "amoeba": "AmoebaAngle",
+        "cosine": "CosineAngle",
+    }
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8.0), constrained_layout=True)
+    ax_flat = (axes[0, 0], axes[0, 1], axes[1, 0])
+    for ax, model in zip(
+        ax_flat,
+        ("harmonic", "amoeba", "cosine"),
+        strict=True,
+    ):
         sub = [r for r in rows if r["model"] == model]
         ax.set_title(titles[model])
         ax.set_xlabel("Number of angles")
@@ -244,6 +254,9 @@ def main() -> None:
             )
             all_rows.extend(
                 benchmark_angle_model(N, dt, AmoebaAngle, "amoeba")
+            )
+            all_rows.extend(
+                benchmark_angle_model(N, dt, CosineAngle, "cosine")
             )
 
     write_angle_csv(all_rows, csv_path)

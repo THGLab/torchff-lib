@@ -83,14 +83,14 @@ def _configure_torch_compile_environment() -> None:
         torch._dynamo.config.accumulated_cache_size_limit = 2048
 
 
-def _compile_dispersion(module: Dispersion, compile_mode: str) -> torch.nn.Module:
+def _compile_dispersion(module: Dispersion, compile_mode: str, fullgraph: bool = False) -> torch.nn.Module:
     from torch._inductor import list_mode_options
 
     if compile_mode == "default":
-        return torch.compile(module, mode="default")
+        return torch.compile(module, mode="default", fullgraph=fullgraph)
     opts = dict(list_mode_options(compile_mode))
     opts["triton.cudagraphs"] = False
-    return torch.compile(module, options=opts)
+    return torch.compile(module, options=opts, fullgraph=fullgraph)
 
 
 DEFAULT_ATOMS = (50, 100, 300, 1000, 3000, 10000)
@@ -169,7 +169,7 @@ def benchmark_dispersion_model(
             use_type_pairs=False,
             cuda_graph_compat=True,
         ).to(device=device, dtype=dtype),
-        compile_mode,
+        compile_mode
     )
     func_ref = _compile_dispersion(
         Dispersion(
@@ -178,6 +178,7 @@ def benchmark_dispersion_model(
             cuda_graph_compat=True,
             sum_output=True,
         ).to(device=device, dtype=dtype),
+        compile_mode, fullgraph=True
     )
 
     perf_ref = perf_op(

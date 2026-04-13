@@ -102,8 +102,8 @@ def benchmark_harmonic_energy(N: int, dtype: torch.dtype) -> list[dict[str, Any]
     device = "cuda"
     dtype_s = _dtype_str(dtype)
     coords, torsions, k, nt = _harmonic_tensors(N, device, dtype)
-    func = torch.compile(HarmonicTorsion(use_customized_ops=True))
-    func_ref = torch.compile(HarmonicTorsion(use_customized_ops=False))
+    func = torch.compile(HarmonicTorsion(use_customized_ops=True), mode='max-autotune-no-cudagraphs')
+    func_ref = torch.compile(HarmonicTorsion(use_customized_ops=False), mode='max-autotune-no-cudagraphs')
 
     perf_r = perf_op(
         func_ref,

@@ -5,9 +5,9 @@ import torch.nn as nn
 import torchff_angle
 
 
-def compute_angles(coords: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+def compute_angles_ref(coords: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     """
-    Compute angle (theta) at the central atom for each angle triple.
+    Reference implementation: angle (theta) at the central atom for each triple (PyTorch only).
 
     For each angle (i, j, k), computes the angle at j between vectors
     (coords[i] - coords[j]) and (coords[k] - coords[j]).
@@ -33,6 +33,45 @@ def compute_angles(coords: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
     cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
     theta = torch.acos(cos_theta)
     return theta
+
+
+@torch._dynamo.disable
+def compute_angles(coords: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+    """
+    Compute angle values via custom CUDA/CPU ops.
+
+    Same geometry as :func:`compute_angles_ref`.
+
+    Parameters
+    ----------
+    coords : torch.Tensor
+        Shape (N, 3), atom coordinates.
+    angles : torch.Tensor
+        Shape (M, 3), integer indices; each row is (i, j, k).
+
+    Returns
+    -------
+    torch.Tensor
+        Shape (M,), angle in radians for each triple.
+    """
+    return torch.ops.torchff.compute_angles(coords, angles)
+
+
+class Angles(nn.Module):
+    """
+    Plane angle values at central atoms (radians), matching :func:`compute_angles_ref` geometry.
+
+    Dispatches to custom ops or reference based on :attr:`use_customized_ops`.
+    """
+
+    def __init__(self, use_customized_ops: bool = False):
+        super().__init__()
+        self.use_customized_ops = use_customized_ops
+
+    def forward(self, coords: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+        if self.use_customized_ops:
+            return compute_angles(coords, angles)
+        return compute_angles_ref(coords, angles)
 
 
 @torch._dynamo.disable
@@ -65,10 +104,10 @@ def compute_harmonic_angle_energy_ref(coords, angles, theta0, k):
     """
     Reference implementation of harmonic angle energy (PyTorch only).
 
-    Uses :func:`compute_angles` then same formula as :func:`compute_harmonic_angle_energy`;
+    Uses :func:`compute_angles_ref` then same formula as :func:`compute_harmonic_angle_energy`;
     used when custom ops are disabled.
     """
-    theta = compute_angles(coords, angles)
+    theta = compute_angles_ref(coords, angles)
     ene = (theta - theta0) ** 2 * k / 2
     return torch.sum(ene)
 
@@ -199,10 +238,10 @@ def compute_amoeba_angle_energy_ref(
     """
     Reference implementation of Amoeba angle energy (PyTorch only).
 
-    Uses :func:`compute_angles`; same formula as :func:`compute_amoeba_angle_energy`;
+    Uses :func:`compute_angles_ref`; same formula as :func:`compute_amoeba_angle_energy`;
     used when custom ops are disabled.
     """
-    theta = compute_angles(coords, angles)
+    theta = compute_angles_ref(coords, angles)
     dtheta = theta - theta0
     poly = 1.0 + cubic * dtheta + quartic * dtheta**2 + pentic * dtheta**3 + sextic * dtheta**4
     ene = k * dtheta**2 * poly
@@ -248,3 +287,87 @@ class AmoebaAngle(nn.Module):
             return compute_amoeba_angle_energy(coords, angles, theta0, k, cubic, quartic, pentic, sextic)
         else:
             return compute_amoeba_angle_energy_ref(coords, angles, theta0, k, cubic, quartic, pentic, sextic)
+
+
+@torch._dynamo.disable
+def compute_cosine_angle_energy(
+    coords: torch.Tensor, angles: torch.Tensor, theta0: torch.Tensor, k: torch.Tensor
+) -> torch.Tensor:
+    """
+    Cosine-style angle energy via custom ops.
+
+    Energy per angle: :math:`E = (1/2) k (\\cos\\theta - \\cos\\theta_0)^2`.
+
+    Parameters
+    ----------
+    coords : torch.Tensor
+        Shape (N, 3), atom coordinates.
+    angles : torch.Tensor
+        Shape (M, 3), angle indices (i, j, k).
+    theta0 : torch.Tensor
+        Shape (M,), equilibrium angles in radians.
+    k : torch.Tensor
+        Shape (M,), force constants.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar total cosine angle energy.
+    """
+    return torch.ops.torchff.compute_cosine_angle_energy(coords, angles, theta0, k)
+
+
+def compute_cosine_angle_energy_ref(coords, angles, theta0, k):
+    """
+    Reference implementation of cosine angle energy (PyTorch only).
+
+    Same formula as :func:`compute_cosine_angle_energy`.
+    """
+    v1 = coords[angles[:, 0]] - coords[angles[:, 1]]
+    v2 = coords[angles[:, 2]] - coords[angles[:, 1]]
+    dot_product = torch.sum(v1 * v2, dim=1)
+    mag_v1 = torch.norm(v1, dim=1)
+    mag_v2 = torch.norm(v2, dim=1)
+    cos_theta = dot_product / (mag_v1 * mag_v2)
+    cos_theta = torch.clamp(cos_theta, -1.0, 1.0)
+    c0 = torch.cos(theta0)
+    dc = cos_theta - c0
+    ene = k * dc * dc / 2
+    return torch.sum(ene)
+
+
+class CosineAngle(nn.Module):
+    """
+    Cosine angle energy: :math:`E = (1/2) k (\\cos\\theta - \\cos\\theta_0)^2`.
+
+    Dispatches to custom ops or reference based on :attr:`use_customized_ops`.
+    """
+
+    def __init__(self, use_customized_ops: bool = False):
+        super().__init__()
+        self.use_customized_ops = use_customized_ops
+
+    def forward(self, coords, angles, theta0, k):
+        if self.use_customized_ops:
+            return compute_cosine_angle_energy(coords, angles, theta0, k)
+        return compute_cosine_angle_energy_ref(coords, angles, theta0, k)
+
+
+def compute_cosine_angle_forces(
+    coords: torch.Tensor,
+    angles: torch.Tensor,
+    theta0: torch.Tensor,
+    k: torch.Tensor,
+    forces: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Cosine angle forces in-place (no autograd).
+
+    Parameters
+    ----------
+    coords, angles, theta0, k
+        Same as :func:`compute_cosine_angle_energy`.
+    forces : torch.Tensor
+        Shape (N, 3), modified in-place.
+    """
+    return torch.ops.torchff.compute_cosine_angle_forces(coords, angles, theta0, k, forces)

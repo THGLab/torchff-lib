@@ -38,8 +38,11 @@ setup(
         build_cuda_extension('angle'),
         build_cuda_extension('torsion'),
         build_cuda_extension('vdw'),
+        build_cuda_extension('dispersion'),
+        build_cuda_extension('slater'),
         build_cuda_extension('coulomb'),
         build_cuda_extension('multipoles'),
+        build_cuda_extension('amoeba'),
         build_cuda_extension('ewald', ['ewald_optimized.cu']),
         build_cuda_extension('pme'),
         build_cuda_extension('cmm'),
@@ -57,7 +60,8 @@ setup(
         CUDAExtension(
             name='torchff_nblist',
             sources=['csrc/nblist/nblist_interface.cpp',
-                     'csrc/nblist/nblist_nsquared_cuda.cu'],
+                     'csrc/nblist/nblist_nsquared_cuda.cu',
+                     'csrc/nblist/nblist_clist_cuda.cu'],
             extra_compile_args={
                 'cxx': ['-O3'],
                 'nvcc': ['-O3'],

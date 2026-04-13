@@ -200,3 +200,122 @@ class AmoebaBond(nn.Module):
             return compute_amoeba_bond_energy(coords, bonds, b0, k, cubic, quartic)
         else:
             return compute_amoeba_bond_energy_ref(coords, bonds, b0, k, cubic, quartic)
+
+
+@torch._dynamo.disable
+def compute_morse_bond_energy(
+    coords: torch.Tensor,
+    bonds: torch.Tensor,
+    b0: torch.Tensor,
+    k: torch.Tensor,
+    d: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute Morse bond energies via custom CUDA/CPU ops.
+
+    Energy per bond: :math:`E = D [1 - e^{-\\beta (r - r_0)}]^2` with
+    :math:`\\beta = \\sqrt{k/(2D)}`, :math:`r` the bond length, :math:`r_0` the
+    equilibrium length, :math:`k` the stiffness, and :math:`D` the well depth.
+
+    Parameters
+    ----------
+    coords : torch.Tensor
+        Shape (N, 3), atom coordinates.
+    bonds : torch.Tensor
+        Shape (M, 2), integer indices; each row is (i, j).
+    b0 : torch.Tensor
+        Shape (M,), equilibrium bond lengths :math:`r_0`.
+    k : torch.Tensor
+        Shape (M,), stiffness parameters :math:`k`.
+    d : torch.Tensor
+        Shape (M,), well depth :math:`D` (must be positive).
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar total Morse bond energy.
+    """
+    return torch.ops.torchff.compute_morse_bond_energy(coords, bonds, b0, k, d)
+
+
+def compute_morse_bond_energy_ref(coords, bonds, b0, k, d):
+    """
+    Reference implementation of Morse bond energy (PyTorch only).
+
+    Same formula as :func:`compute_morse_bond_energy`; used when custom ops are disabled.
+    """
+    r = torch.norm(coords[bonds[:, 0]] - coords[bonds[:, 1]], dim=1)
+    beta = torch.sqrt(k / (2 * d))
+    z = 1.0 - torch.exp(-beta * (r - b0))
+    ene = d * z * z
+    return torch.sum(ene)
+
+
+class MorseBond(nn.Module):
+    """
+    Morse bond energy module.
+
+    Dispatches to custom ops or a PyTorch reference implementation based on
+    :attr:`use_customized_ops`.
+    """
+
+    def __init__(self, use_customized_ops: bool = False):
+        super().__init__()
+        self.use_customized_ops = use_customized_ops
+
+    def forward(self, coords, bonds, b0, k, d):
+        """
+        Compute total Morse bond energy.
+
+        Parameters
+        ----------
+        coords : torch.Tensor
+            Shape (N, 3), atom coordinates.
+        bonds : torch.Tensor
+            Shape (M, 2), bond indices.
+        b0 : torch.Tensor
+            Shape (M,), equilibrium lengths.
+        k : torch.Tensor
+            Shape (M,), stiffness parameters.
+        d : torch.Tensor
+            Shape (M,), well depths.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar total energy.
+        """
+        if self.use_customized_ops:
+            return compute_morse_bond_energy(coords, bonds, b0, k, d)
+        return compute_morse_bond_energy_ref(coords, bonds, b0, k, d)
+
+
+def compute_morse_bond_forces(
+    coords: torch.Tensor,
+    bonds: torch.Tensor,
+    b0: torch.Tensor,
+    k: torch.Tensor,
+    d: torch.Tensor,
+    forces: torch.Tensor,
+):
+    """
+    Compute Morse bond forces in-place (no autograd).
+
+    Adds bond force contributions into ``forces``.
+
+    Parameters
+    ----------
+    coords : torch.Tensor
+        Shape (N, 3), atom coordinates.
+    bonds : torch.Tensor
+        Shape (M, 2), bond indices.
+    b0 : torch.Tensor
+        Shape (M,), equilibrium lengths.
+    k : torch.Tensor
+        Shape (M,), stiffness parameters.
+    d : torch.Tensor
+        Shape (M,), well depths.
+    forces : torch.Tensor
+        Shape (N, 3), modified in-place with bond forces.
+    """
+    return torch.ops.torchff.compute_morse_bond_forces(coords, bonds, b0, k, d, forces)

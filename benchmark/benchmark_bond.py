@@ -23,7 +23,7 @@ import torch
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from torchff.bond import AmoebaBond, HarmonicBond
+from torchff.bond import AmoebaBond, HarmonicBond, MorseBond
 from torchff.test_utils import perf_op
 
 DEFAULT_N_VALUES = (1000, 10_000, 100_000, 1_000_000)
@@ -66,6 +66,14 @@ def _bond_pairs_and_tensors(
     return coords, pairs, r0, k, n_bonds
 
 
+def _morse_bond_pairs_and_tensors(
+    N: int, device: str, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    coords, pairs, r0, k, n_bonds = _bond_pairs_and_tensors(N, device, dtype)
+    d = torch.rand(pairs.shape[0], device=device, dtype=dtype, requires_grad=False) + 0.1
+    return coords, pairs, r0, k, d, n_bonds
+
+
 def _dtype_str(dtype: torch.dtype) -> str:
     return "float32" if dtype is torch.float32 else "float64"
 
@@ -80,8 +88,8 @@ def benchmark_bond_model(
     device = "cuda"
     dtype_s = _dtype_str(dtype)
     coords, pairs, r0, k, nb = _bond_pairs_and_tensors(N, device, dtype)
-    func = torch.compile(bond_cls(use_customized_ops=True))
-    func_ref = torch.compile(bond_cls(use_customized_ops=False))
+    func = torch.compile(bond_cls(use_customized_ops=True), mode='max-autotune-no-cudagraphs')
+    func_ref = torch.compile(bond_cls(use_customized_ops=False), mode='max-autotune-no-cudagraphs')
 
     perf_ref = perf_op(
         func_ref,
@@ -134,6 +142,71 @@ def benchmark_bond_model(
     return rows
 
 
+def benchmark_morse_bond_model(
+    N: int,
+    dtype: torch.dtype,
+) -> list[dict[str, Any]]:
+    """Run ref + torchff for :class:`MorseBond` (extra well-depth tensor ``d``)."""
+    device = "cuda"
+    dtype_s = _dtype_str(dtype)
+    coords, pairs, r0, k, d, nb = _morse_bond_pairs_and_tensors(N, device, dtype)
+    model_name = "morse"
+    func = torch.compile(MorseBond(use_customized_ops=True))
+    func_ref = torch.compile(MorseBond(use_customized_ops=False))
+
+    perf_ref = perf_op(
+        func_ref,
+        coords,
+        pairs,
+        r0,
+        k,
+        d,
+        desc=f"ref-{model_name}-bond N={N} n_bonds={nb} {dtype_s}",
+        run_backward=True,
+        use_cuda_graph=True,
+        explicit_sync=False,
+    )
+    perf_tf = perf_op(
+        func,
+        coords,
+        pairs,
+        r0,
+        k,
+        d,
+        desc=f"torchff-{model_name}-bond N={N} n_bonds={nb} {dtype_s}",
+        run_backward=True,
+        use_cuda_graph=True,
+        explicit_sync=False,
+    )
+
+    rows = [
+        {
+            "dtype": dtype_s,
+            "N": N,
+            "n_bonds": nb,
+            "model": model_name,
+            "variant": "ref",
+            "mean_ms": float(np.mean(perf_ref)),
+            "std_ms": float(np.std(perf_ref)),
+        },
+        {
+            "dtype": dtype_s,
+            "N": N,
+            "n_bonds": nb,
+            "model": model_name,
+            "variant": "torchff",
+            "mean_ms": float(np.mean(perf_tf)),
+            "std_ms": float(np.std(perf_tf)),
+        },
+    ]
+    for r in rows:
+        print(
+            f"{r['dtype']}\tN={r['N']}\tn_bonds={r['n_bonds']}\t{r['model']}\t{r['variant']}\t"
+            f"mean_ms={r['mean_ms']:.6f}\tstd_ms={r['std_ms']:.6f}"
+        )
+    return rows
+
+
 def write_bond_csv(rows: list[dict[str, Any]], csv_path: Path) -> None:
     fieldnames = ["dtype", "N", "n_bonds", "model", "variant", "mean_ms", "std_ms"]
     with csv_path.open("w", newline="") as f:
@@ -152,12 +225,12 @@ def _row_n_bonds(r: dict[str, Any]) -> int:
 
 
 def plot_bond_benchmark(rows: list[dict[str, Any]], pdf_path: Path) -> None:
-    """Log-log plots: HarmonicBond vs AmoebaBond in two subplots."""
+    """Log-log plots: HarmonicBond, AmoebaBond, MorseBond."""
     dtype_colors = {"float32": "C0", "float64": "C3"}
     variant_linestyle = {"ref": "--", "torchff": "-"}
-    titles = {"harmonic": "HarmonicBond", "amoeba": "AmoebaBond"}
-    fig, (ax_h, ax_a) = plt.subplots(1, 2, figsize=(10, 4.2), constrained_layout=True)
-    for ax, model in ((ax_h, "harmonic"), (ax_a, "amoeba")):
+    titles = {"harmonic": "HarmonicBond", "amoeba": "AmoebaBond", "morse": "MorseBond"}
+    fig, (ax_h, ax_a, ax_m) = plt.subplots(1, 3, figsize=(14, 4.2), constrained_layout=True)
+    for ax, model in ((ax_h, "harmonic"), (ax_a, "amoeba"), (ax_m, "morse")):
         sub = [r for r in rows if r["model"] == model]
         ax.set_title(titles[model])
         ax.set_xlabel("Number of Bonds")
@@ -249,6 +322,7 @@ def main() -> None:
             all_rows.extend(
                 benchmark_bond_model(N, dt, AmoebaBond, "amoeba")
             )
+            all_rows.extend(benchmark_morse_bond_model(N, dt))
 
     write_bond_csv(all_rows, csv_path)
     if all_rows:
