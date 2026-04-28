@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch  # noqa: E402
 import torch.nn as nn
 import torchff  # noqa: E402
-from tests.utils import perf_op  # noqa: E402
+from torchff.test_utils import perf_op  # noqa: E402
 from torchpme import EwaldCalculator, PMECalculator  # noqa: E402
 from torchpme.potentials import CoulombPotential  # noqa: E402
 from torchpme.tuning import tune_ewald  # noqa: E402

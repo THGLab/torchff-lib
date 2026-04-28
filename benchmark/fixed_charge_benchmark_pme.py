@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torchff  # noqa: E402
 from tests.get_reference import get_water_data  # noqa: E402
-from tests.utils import perf_op  # noqa: E402
+from torchff.test_utils import perf_op  # noqa: E402
 from tests.water.run_openmm import run_openmm_water_md  # noqa: E402
 from torchff.bond import HarmonicBond  # noqa: E402
 from torchff.angle import HarmonicAngle  # noqa: E402

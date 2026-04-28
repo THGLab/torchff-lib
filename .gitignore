@@ -181,6 +181,7 @@ profile/
 .cursor/
 
 benchmark/torchmd-net/
+benchmark/nvalchemi-toolkit-ops/
 benchmark/*nsys*
 benchmark/*ncu*
 benchmark/*sqlite
@@ -196,3 +197,5 @@ benchmark/*.txt
 csrc/nblist/nblist_clist_cuda_new.cu
 csrc/nblist/nblist_cluster_pairs_cuda.cu
 csrc/nblist/nblist_cluster_pairs_slow_cuda.cu
+
+examples/torch-sim

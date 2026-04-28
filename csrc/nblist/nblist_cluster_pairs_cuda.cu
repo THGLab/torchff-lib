@@ -9,27 +9,10 @@
 
 #include "common/vec3.cuh"
 #include "common/pbc.cuh"
+#include "nblist/exclusions.cuh"
 
 #define BLOCK_DIM 256
 #define BUFFER_SIZE 256
-
-
-__device__ __forceinline__ bool in_list(int32_t x, int32_t* list, int32_t n, int32_t skip) {
-    if ( !list ) {
-        return false;
-    }
-    bool in = false;
-    for (int pos = 0; pos < n; ++pos) {
-        if ( list[pos] == skip ) {
-            continue;
-        }
-        if ( x == list[pos] ) {
-            in = true;
-            break;
-        }
-    }
-    return in;
-}
 
 
 template <typename scalar_t> 

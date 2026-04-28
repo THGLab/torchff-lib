@@ -7,7 +7,7 @@ import openmm.app as app
 import torch
 import torchff
 
-from .utils import perf_op, check_op
+from torchff.test_utils import check_op, perf_op
 from .get_reference import get_water_data
 from torchff.nonbonded import Nonbonded
 
@@ -90,6 +90,7 @@ def test_nonbonded_energy(device, dtype):
     )
 
 
+@pytest.mark.performance
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
 def test_perf_nonbonded(device, dtype):
     """

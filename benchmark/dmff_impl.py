@@ -16,13 +16,20 @@ def perf_jax(func, *args, desc="perf_jax", warmup=10, repeat=1000):
         out = func(*args)
         jax.block_until_ready(out)
 
-    perf = []
+    # perf = []
+    # for _ in range(repeat):
+    #     start = time.perf_counter()
+    #     out = func(*args)
+    #     jax.block_until_ready(out)
+    #     end = time.perf_counter()
+    #     perf.append((end - start) * 1000)
+
+    start = time.perf_counter()
     for _ in range(repeat):
-        start = time.perf_counter()
         out = func(*args)
-        jax.block_until_ready(out)
-        end = time.perf_counter()
-        perf.append((end - start) * 1000)
+    jax.block_until_ready(out)
+    end = time.perf_counter()
+    perf = [(end - start) * 1000 / repeat for _ in range(repeat)]
 
     perf = np.array(perf)
     print(f"{desc} - Time: {np.mean(perf):.4f} +/- {np.std(perf):.4f} ms")

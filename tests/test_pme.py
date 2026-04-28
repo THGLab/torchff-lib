@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from .utils import perf_op, check_op
+from torchff.test_utils import check_op, perf_op
 from torchff.pme import PME
 
 
@@ -126,6 +126,7 @@ def test_pme_with_field_simple(device, dtype, rank):
     )
 
 
+@pytest.mark.performance
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float64)])
 @pytest.mark.parametrize("rank", [0, 1, 2])
 def test_perf_pme(device, dtype, rank):

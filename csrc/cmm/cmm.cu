@@ -240,7 +240,19 @@ __global__ void cmm_nonbonded_non_elec_interaction_from_pairs_kernel(
         // Dispersion
         scalar_t c6_disp = C6_disp_ij[index];
         scalar_t b_disp = b_disp_ij[index];
-        tang_tonnies_6_dispersion(c6_disp, b_disp, dr, drx, dry, drz, &etmp, &drx_grad_tmp, &dry_grad_tmp, &drz_grad_tmp);
+        tang_tonnies_6_dispersion(
+            c6_disp,
+            b_disp,
+            dr,
+            drx,
+            dry,
+            drz,
+            &etmp,
+            &drx_grad_tmp,
+            &dry_grad_tmp,
+            &drz_grad_tmp,
+            static_cast<scalar_t*>(nullptr),
+            static_cast<scalar_t*>(nullptr));
 
         s = clamp_((dr - rcut_lr + rcut_switch_buf) / rcut_switch_buf, ZERO, ONE);
         sg = SWITCH_GRAD(s) / rcut_switch_buf / dr;

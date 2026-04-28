@@ -8,6 +8,12 @@ from torchff.test_utils import check_op
 from torchff.vdw import Vdw
 
 
+def test_vdw_custom_requires_sum_output() -> None:
+    """Custom vdW ops cannot return per-pair energies; sum_output must stay True."""
+    with pytest.raises(ValueError, match="sum_output must be True"):
+        Vdw(use_customized_ops=True, sum_output=False)
+
+
 def _build_all_pairs(num_atoms: int, device: torch.device) -> torch.Tensor:
     """All unique pairs (i < j), shape (P, 2) with P = n*(n-1)/2."""
     idx = torch.arange(num_atoms, device=device, dtype=torch.int64)
@@ -82,7 +88,6 @@ def test_vdw_custom_matches_reference(vdw_function: str, dtype: torch.dtype) -> 
     func_ref = Vdw(
         function=vdw_function,
         use_customized_ops=False,
-        sum_output=True,
         cuda_graph_compat=True,
     ).to(device=device, dtype=dtype)
 

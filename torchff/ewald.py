@@ -5,6 +5,24 @@ import torchff
 import torchff_ewald
 
 
+@torch._dynamo.disable
+def ewald_long_range(
+    coords: torch.Tensor, box: torch.Tensor, 
+    q: torch.Tensor, p: torch.Tensor | None, t: torch.Tensor | None, 
+    kmax: int, alpha: float
+):
+    return torch.ops.torchff.ewald_long_range(coords, box, q, p, t, kmax, alpha)
+
+
+@torch._dynamo.disable
+def ewald_long_range_with_fields(
+    coords: torch.Tensor, box: torch.Tensor, 
+    q: torch.Tensor, p: torch.Tensor | None, t: torch.Tensor | None, 
+    kmax: int, alpha: float
+):
+    return torch.ops.torchff.ewald_long_range_all(coords, box, q, p, t, kmax, alpha)
+
+
 class Ewald(nn.Module):
     def __init__(self, alpha: float, kmax: int, rank: int, use_customized_ops: bool = True, return_fields: bool = True):
         super().__init__()
@@ -33,9 +51,9 @@ class Ewald(nn.Module):
     def forward(self, coords, box, q, p=None, t=None):
         if self.use_customized_ops:
             if not self.return_fields:
-                return torch.ops.torchff.ewald_long_range(coords, box, q, p, t, self.kmax, self.alpha)
+                return ewald_long_range(coords, box, q, p, t, self.kmax, self.alpha)
             else:
-                return torch.ops.torchff.ewald_long_range_all(coords, box, q, p, t, self.kmax, self.alpha)
+                return ewald_long_range_with_fields(coords, box, q, p, t, self.kmax, self.alpha)
         else:
             return self._forward_python(coords, box, q, p, t)
 
@@ -90,7 +108,7 @@ class Ewald(nn.Module):
         potential = (2.0 / torch.pi / V) * torch.sum(K_real, dim=0)
         potential = potential - 2 * self.alpha_over_root_pi * q  # self contributions
         if self.rank == 0:
-            return potential
+            return energy, potential, torch.zeros((q.size(0), 3), device=q.device, dtype=q.dtype)
         
         # equation 2.10
         K_imag = S_real_expanded.unsqueeze(1) * sin_k_dot_r - S_imag_expanded.unsqueeze(1) * cos_k_dot_r # (M,N)
@@ -98,12 +116,12 @@ class Ewald(nn.Module):
         field = field + self.alpha_over_root_pi * (4 * self.alpha2 / 3) * p
 
         if self.rank == 1:
-            return potential, field
+            return energy, potential, field
         
         # k_outer = torch.einsum('bi,bj->bij', kvectors, kvectors) # (M, 3, 3)
         # field_grad = 8.0 * torch.pi / V * (torch.matmul(K_real.T, k_outer.reshape(-1, 9))).reshape(-1, 3, 3)
         field_grad = 8.0 * torch.pi / V * torch.einsum('mj,mx,my->jxy', K_real, kvectors, kvectors)
         field_grad = field_grad + self.alpha_over_root_pi * (16 * self.alpha2 * self.alpha2 / 5) * t / 3
         if self.rank == 2:
-            return potential, field, field_grad
+            return energy, potential, field
         

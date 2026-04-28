@@ -32,7 +32,7 @@ setup(
         'Intended Audience :: Science/Research',
         'Programming Language :: Python :: 3.12',
     ],
-    packages=find_packages(exclude=['csrc', 'tests', 'docs'], include=['torchff']),
+    packages=find_packages(exclude=['csrc', 'tests', 'docs'], include=['torchff*']),
     ext_modules=[
         build_cuda_extension('bond'),
         build_cuda_extension('angle'),

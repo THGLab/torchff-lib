@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from .utils import perf_op, check_op
+from torchff.test_utils import check_op, perf_op
 from torchff.ewald import Ewald
 
 
@@ -97,6 +97,7 @@ def test_ewald_energy(device, dtype, rank):
     )
 
 
+@pytest.mark.performance
 @pytest.mark.parametrize("device, dtype", [("cuda", torch.float32), ("cuda", torch.float64)])
 @pytest.mark.parametrize("rank", [0])
 def test_perf_ewald(device, dtype, rank):

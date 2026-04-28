@@ -39,20 +39,20 @@ __global__ void spread_q_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N_atoms) return;
 
-    MultipoleAccum<T, RANK> mp{};
-    mp.c0 = q[idx];
+    CartesianExpansion<T, RANK> mp{};
+    mp.s = q[idx];
     if constexpr (RANK >= 1) {
-        mp.dx = p[idx * 3 + 0];
-        mp.dy = p[idx * 3 + 1];
-        mp.dz = p[idx * 3 + 2];
+        mp.x = p[idx * 3 + 0];
+        mp.y = p[idx * 3 + 1];
+        mp.z = p[idx * 3 + 2];
     }
     if constexpr (RANK >= 2) {
-        mp.qxx = Q[idx * 9 + 0];
-        mp.qxy = Q[idx * 9 + 1];
-        mp.qxz = Q[idx * 9 + 2];
-        mp.qyy = Q[idx * 9 + 4];
-        mp.qyz = Q[idx * 9 + 5];
-        mp.qzz = Q[idx * 9 + 8];
+        mp.xx = Q[idx * 9 + 0];
+        mp.xy = Q[idx * 9 + 1];
+        mp.xz = Q[idx * 9 + 2];
+        mp.yy = Q[idx * 9 + 4];
+        mp.yz = Q[idx * 9 + 5];
+        mp.zz = Q[idx * 9 + 8];
     }
 
     T r[3];
@@ -100,7 +100,7 @@ __global__ void spread_q_kernel(
                 T d2Mx = (RANK >= 2) ? d2M[0][ix] : (T)0.0;
 
                 T theta = Mx * My * Mz;
-                T term = mp.c0 * theta;
+                T term = mp.s * theta;
 
                 if constexpr (RANK >= 1) {
                     // Initialize b-spline derivative
@@ -116,15 +116,15 @@ __global__ void spread_q_kernel(
                         dt_dr[1] += cart2frac[i][1] * dt_du[i];
                         dt_dr[2] += cart2frac[i][2] * dt_du[i];
                     }
-                    term -= mp.dx * dt_dr[0] + mp.dy * dt_dr[1] + mp.dz * dt_dr[2];
+                    term -= mp.x * dt_dr[0] + mp.y * dt_dr[1] + mp.z * dt_dr[2];
                     if constexpr (RANK >= 2) {
                         // 1. Load Cartesian Quadrupoles
-                        T& Qxx = mp.qxx;
-                        T& Qxy = mp.qxy;
-                        T& Qxz = mp.qxz;
-                        T& Qyy = mp.qyy;
-                        T& Qyz = mp.qyz;
-                        T& Qzz = mp.qzz;
+                        T& Qxx = mp.xx;
+                        T& Qxy = mp.xy;
+                        T& Qxz = mp.xz;
+                        T& Qyy = mp.yy;
+                        T& Qyz = mp.yz;
+                        T& Qzz = mp.zz;
 
                         // 3. Transform Q_cart to Q_lat
                         // Q_lat = A * Q_cart * A^T
@@ -224,20 +224,20 @@ __global__ void interpolate_kernel(
     if (idx >= N_atoms) return;
 
     // Multipole Setup
-    MultipoleAccum<T, RANK> mp{};
-    mp.c0 = q[idx];
+    CartesianExpansion<T, RANK> mp{};
+    mp.s = q[idx];
     if constexpr (RANK >= 1) {
-        mp.dx = p[idx * 3 + 0];
-        mp.dy = p[idx * 3 + 1];
-        mp.dz = p[idx * 3 + 2];
+        mp.x = p[idx * 3 + 0];
+        mp.y = p[idx * 3 + 1];
+        mp.z = p[idx * 3 + 2];
     }
     if constexpr (RANK >= 2) {
-        mp.qxx = Q[idx * 9 + 0];
-        mp.qxy = Q[idx * 9 + 1];
-        mp.qxz = Q[idx * 9 + 2];
-        mp.qyy = Q[idx * 9 + 4];
-        mp.qyz = Q[idx * 9 + 5];
-        mp.qzz = Q[idx * 9 + 8];
+        mp.xx = Q[idx * 9 + 0];
+        mp.xy = Q[idx * 9 + 1];
+        mp.xz = Q[idx * 9 + 2];
+        mp.yy = Q[idx * 9 + 4];
+        mp.yz = Q[idx * 9 + 5];
+        mp.zz = Q[idx * 9 + 8];
     }
 
     // --- 1. Geometry Setup ---
@@ -271,19 +271,19 @@ __global__ void interpolate_kernel(
     if constexpr (RANK >= 1) {
         #pragma unroll
         for(int i=0; i<3; i++)
-            p_lat[i] = (mp.dx * cart2frac[i][0] + mp.dy * cart2frac[i][1] + mp.dz * cart2frac[i][2]);
+            p_lat[i] = (mp.x * cart2frac[i][0] + mp.y * cart2frac[i][1] + mp.z * cart2frac[i][2]);
     }
 
     // Quadrupoles
     T Q_lat[6] = {(T)0.0};
     if constexpr (RANK >= 2) {
         // Initialize quadrupoles
-        T& Qxx = mp.qxx;
-        T& Qxy = mp.qxy;
-        T& Qxz = mp.qxz;
-        T& Qyy = mp.qyy;
-        T& Qyz = mp.qyz;
-        T& Qzz = mp.qzz;
+        T& Qxx = mp.xx;
+        T& Qxy = mp.xy;
+        T& Qxz = mp.xz;
+        T& Qyy = mp.yy;
+        T& Qyz = mp.yz;
+        T& Qzz = mp.zz;
 
         T Q_cart[3][3];
         Q_cart[0][0]=Qxx; Q_cart[0][1]=Qxy; Q_cart[0][2]=Qxz;
@@ -464,9 +464,9 @@ __global__ void interpolate_kernel(
         EG_atoms[base + 8] += EFG[2][2] * factor;
     }
 
-    force_atoms[idx*3 + 0] += (mp.c0 * grad_cart[0] - grad_U_dip[0] + grad_U_quad[0]);
-    force_atoms[idx*3 + 1] += (mp.c0 * grad_cart[1] - grad_U_dip[1] + grad_U_quad[1]);
-    force_atoms[idx*3 + 2] += (mp.c0 * grad_cart[2] - grad_U_dip[2] + grad_U_quad[2]);
+    force_atoms[idx*3 + 0] += (mp.s * grad_cart[0] - grad_U_dip[0] + grad_U_quad[0]);
+    force_atoms[idx*3 + 1] += (mp.s * grad_cart[1] - grad_U_dip[1] + grad_U_quad[1]);
+    force_atoms[idx*3 + 2] += (mp.s * grad_cart[2] - grad_U_dip[2] + grad_U_quad[2]);
 }
 
 

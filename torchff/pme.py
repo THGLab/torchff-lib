@@ -9,6 +9,7 @@ try:
 except ImportError:
     pass
 
+
 class PME(nn.Module):
     def __init__(self, alpha: float, max_hkl: int, rank: int, use_customized_ops: bool = False, return_fields: bool = False):
         super().__init__()
@@ -71,7 +72,8 @@ class PME(nn.Module):
             if self.rank >= 2 and t is not None:
                 t = self._pack_quadrupoles(t)
             return self._forward_python(coords, box, q, p, t)
-
+    
+    @torch._dynamo.disable
     def _forward_cpp(self, coords, box, q, p, t_packed):
         if not self.return_fields:
             return torch.ops.torchff.pme_long_range(

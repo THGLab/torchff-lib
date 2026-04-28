@@ -14,8 +14,8 @@ import openmm.unit as unit
 import sys
 test_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(test_dir, '../../'))
-from torchff.rotation import (
-    computeLocal2GlobalRotationMatrices,
+from torchff.multipolar.rotation import (
+    _compute_rotation_matrices_python,
     rotateDipoles,
     rotateQuadrupoles,
 )
@@ -121,14 +121,12 @@ x_atoms_t = torch.tensor(x_atoms, dtype=torch.int64, device=device)
 y_atoms_t = torch.tensor(y_atoms, dtype=torch.int64, device=device)
 
 # Compute local->global rotation matrices and rotate dipoles/quadrupoles.
-rot_mats = computeLocal2GlobalRotationMatrices(
+rot_mats = _compute_rotation_matrices_python(
     coords,
     z_atoms_t,
     x_atoms_t,
     y_atoms_t,
     axis_types_t,
-    None,
-    None,
 )
 p_global = rotateDipoles(p_local, rot_mats).squeeze(1)
 t_global = rotateQuadrupoles(t_local, rot_mats)

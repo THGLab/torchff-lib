@@ -5,8 +5,10 @@ import torchff_nb  # noqa: F401 - ensure CUDA extension is loaded
 
 from .coulomb import compute_coulomb_energy_ref
 from .vdw import compute_lennard_jones_energy_ref
+from .pbc import PBC
 
 
+@torch._dynamo.disable
 def compute_nonbonded_energy_from_atom_pairs(
     coords: torch.Tensor,
     pairs: torch.Tensor,

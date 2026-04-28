@@ -125,6 +125,9 @@ __global__ void vdw_cuda_kernel(
          index += BLOCK_SIZE * gridDim.x) {
         int64_t i = pairs[index * 2];
         int64_t j = pairs[index * 2 + 1];
+        if (i < 0 || j < 0) {
+            continue;
+        }
         int64_t offset_i = 3 * i;
         int64_t offset_j = 3 * j;
 

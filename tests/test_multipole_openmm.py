@@ -17,8 +17,8 @@ import openmm.unit as unit
 
 import torchff
 from torchff.multipoles import MultipolarInteraction
-from torchff.rotation import (
-    computeLocal2GlobalRotationMatrices,
+from torchff.multipolar.rotation import (
+    _compute_rotation_matrices_python,
     rotateDipoles,
     rotateQuadrupoles,
 )
@@ -245,16 +245,12 @@ def create_reference_data(N: int, rank: int, use_pme: bool, device, dtype, use_p
     y_atoms_t = torch.tensor(y_atoms, dtype=torch.int64, device=device)
 
     # Compute local->global rotation matrices and rotate dipoles/quadrupoles.
-    box = torch.tensor([[v.x, v.y, v.z] for v in box_vectors], dtype=dtype, device=device)
-    box_inv = torch.linalg.inv(box)
-    rot_mats = computeLocal2GlobalRotationMatrices(
+    rot_mats = _compute_rotation_matrices_python(
         coords,
         z_atoms_t,
         x_atoms_t,
         y_atoms_t,
         axis_types_t,
-        box,
-        box_inv,
     )
     p_global = rotateDipoles(p_local, rot_mats).squeeze(1)
     t_global = rotateQuadrupoles(t_local, rot_mats)

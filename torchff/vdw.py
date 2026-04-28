@@ -155,7 +155,7 @@ class Vdw(nn.Module):
         cutoff: Optional[float] = None,
         use_customized_ops: bool = False,
         use_type_pairs: bool = False,
-        sum_output: bool = False,
+        sum_output: bool = True,
         cuda_graph_compat: bool = True,
     ):
         """
@@ -171,7 +171,9 @@ class Vdw(nn.Module):
             If True, ``sigma`` and ``epsilon`` are indexed by ``atom_types`` for each pair
             (shape ``(n_types, n_types)``).
         sum_output : bool, optional
-            If True, return a scalar sum over pairs. Requires ``use_customized_ops`` False.
+            If True (default), return a scalar sum over pairs. Must be True when
+            ``use_customized_ops`` is True because the custom kernels only return total energy.
+            When ``use_customized_ops`` is False, if False return per-pair energies of shape ``(P,)``.
         cuda_graph_compat : bool, optional
             If True (default), apply the cutoff with :func:`torch.where` so tensor shapes are
             stable; if False, distances are filtered with boolean indexing before the energy expression.
@@ -183,8 +185,11 @@ class Vdw(nn.Module):
         self.cuda_graph_compat = cuda_graph_compat
         self.pbc = PBC()
         self.cutoff = cutoff
-        if self.sum_output:
-            assert self.use_customized_ops == False
+        if self.use_customized_ops and not self.sum_output:
+            raise ValueError(
+                "sum_output must be True when use_customized_ops is True "
+                "(custom vdW kernels only compute total energy, not per-pair terms)."
+            )
         self.function = function
         assert self.function in ('LennardJones', 'AmoebaVdw147'), f'Invalid vdw function: {function}'
     

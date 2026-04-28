@@ -58,7 +58,7 @@ static at::Tensor forward(
         || (p.has_value() && p.value().requires_grad())
         || (t.has_value() && t.value().requires_grad());
 
-    at::Tensor ene = at::zeros({1}, coords.options());
+    at::Tensor ene = at::zeros({}, coords.options());
     at::Tensor coord_grad = need_coord_grad ? at::zeros_like(coords) : at::Tensor();
     at::Tensor q_grad = need_mpole_grad ? at::zeros_like(q) : at::Tensor();
     at::Tensor p_grad = (need_mpole_grad && rank >= 1) ? at::zeros_like(p.value()) : at::Tensor();

@@ -13,7 +13,7 @@ DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "nblist_benchmark.csv")
 ENGINE_LABELS = {
     "nsquared": "TorchFF",
     "cell_list": "TorchFF",
-    "python": "TorchFF (Python)",
+    "python": "Native",
     "vesin_bf": "Vesin",
     "vesin_cl": "Vesin",
     "vesin": "Vesin",
@@ -23,26 +23,19 @@ ENGINE_LABELS = {
     "torchmd_cell": "TorchMD-Net",
 }
 
+# (color, linestyle, marker) — all solid: TorchFF C0, Native C1, Vesin C2, ALCHEMI C3, TorchMD-Net C6
 ENGINE_STYLES = {
-    # (color_index, linestyle, marker)
-    "nsquared":      (0, "-", "o"),
-    "cell_list":     (0, "-", "s"),
-    "python":        (0, ":", "^"),
-    "vesin_bf":      (1, "-", "o"),
-    "vesin_cl":      (1, "-", "s"),
-    "vesin":         (1, "-", "o"),
-    "alchemi_naive": (2, "-", "o"),
-    "alchemi_cl":    (2, "-", "s"),
-    "torchmd_brute": (3, "-", "o"),
-    "torchmd_cell":  (3, "-", "s"),
+    "nsquared":      ("C0", "solid", "o"),
+    "cell_list":     ("C0", "solid", "s"),
+    "python":        ("C1", "solid", "^"),
+    "vesin_bf":      ("C2", "solid", "o"),
+    "vesin_cl":      ("C2", "solid", "s"),
+    "vesin":         ("C2", "solid", "o"),
+    "alchemi_naive": ("C3", "solid", "o"),
+    "alchemi_cl":    ("C3", "solid", "s"),
+    "torchmd_brute": ("C6", "solid", "o"),
+    "torchmd_cell":  ("C6", "solid", "s"),
 }
-
-PLOT_COLORS = [
-    "#b2182b",  # TorchFF (red)
-    "#2166ac",  # Vesin (blue)
-    "#2ca02c",  # ALCHEMI (green)
-    "#ff7f0e",  # TorchMD-Net (orange)
-]
 
 BF_ENGINES = ["nsquared", "python", "vesin_bf", "vesin", "alchemi_naive", "torchmd_brute"]
 CL_ENGINES = ["cell_list", "vesin_cl", "alchemi_cl", "torchmd_cell"]
@@ -71,12 +64,15 @@ def _plot_engine_subset(
         if not np.any(valid):
             continue
         label = ENGINE_LABELS.get(engine, engine)
-        style = ENGINE_STYLES.get(engine, (0, "-", "o"))
-        color_idx, linestyle, marker = style
-        color = PLOT_COLORS[color_idx] if color_idx < len(PLOT_COLORS) else f"C{color_idx}"
+        color, linestyle, marker = ENGINE_STYLES.get(engine, ("C0", "solid", "o"))
         ax.plot(
             x[valid], ms[valid],
-            color=color, linestyle=linestyle, marker=marker, label=label,
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            markerfacecolor=color,
+            markeredgecolor=color,
+            label=label,
         )
 
     valid_results = [

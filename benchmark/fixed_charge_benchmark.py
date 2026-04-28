@@ -14,11 +14,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torchff  # noqa: E402
 from tests.get_reference import get_water_data  # noqa: E402
-from tests.utils import perf_op  # noqa: E402
+from torchff.test_utils import perf_op  # noqa: E402
 from tests.water.run_openmm import run_openmm_water_md  # noqa: E402
 from torchff.bond import HarmonicBond  # noqa: E402
 from torchff.angle import HarmonicAngle  # noqa: E402
 from torchff.ewald import Ewald  # noqa: E402
+from torchff.pme import PME  # noqa: E402
 from torchff.nonbonded import Nonbonded  # noqa: E402
 
 
@@ -48,19 +49,31 @@ def _build_torchff_models(
     kmax: int,
     device: str,
     dtype: torch.dtype,
-) -> Tuple[HarmonicBond, HarmonicAngle, Nonbonded, Ewald]:
-    """Construct TorchFF modules for bond, angle, nonbonded and Ewald (custom ops)."""
+    long_range: str,
+) -> Tuple[HarmonicBond, HarmonicAngle, Nonbonded, torch.nn.Module]:
+    """Construct TorchFF modules for bond, angle, nonbonded and long-range term."""
     bond = HarmonicBond(use_customized_ops=True).to(device=device, dtype=dtype)
     angle = HarmonicAngle(use_customized_ops=True).to(device=device, dtype=dtype)
     nonbonded = Nonbonded(use_customized_ops=True).to(device=device, dtype=dtype)
-    ewald = Ewald(
-        alpha=alpha,
-        kmax=kmax,
-        rank=0,
-        use_customized_ops=True,
-        return_fields=False,
-    ).to(device=device, dtype=dtype)
-    return bond, angle, nonbonded, ewald
+
+    if long_range == "pme":
+        lr_module: torch.nn.Module = PME(
+            alpha=alpha,
+            max_hkl=kmax,
+            rank=0,
+            use_customized_ops=True,
+            return_fields=False,
+        ).to(device=device, dtype=dtype)
+    else:
+        lr_module = Ewald(
+            alpha=alpha,
+            kmax=kmax,
+            rank=0,
+            use_customized_ops=True,
+            return_fields=False,
+        ).to(device=device, dtype=dtype)
+
+    return bond, angle, nonbonded, lr_module
 
 
 class TorchFFFixedChargeModel(torch.nn.Module):
@@ -71,13 +84,20 @@ class TorchFFFixedChargeModel(torch.nn.Module):
         bond: HarmonicBond,
         angle: HarmonicAngle,
         nonbonded: Nonbonded,
-        ewald: Ewald,
+        long_range: torch.nn.Module,
+        cuda_streams: bool = True
     ) -> None:
         super().__init__()
         self.bond = bond
         self.angle = angle
         self.nonbonded = nonbonded
-        self.ewald = ewald
+        self.long_range = long_range
+        self.use_cuda_streams = cuda_streams
+        if cuda_streams:
+            self.s1 = torch.cuda.Stream()
+            self.s2 = torch.cuda.Stream()
+            self.s3 = torch.cuda.Stream()
+            self.s4 = torch.cuda.Stream()
 
     def forward(
         self,
@@ -96,22 +116,52 @@ class TorchFFFixedChargeModel(torch.nn.Module):
         coul_constant: float,
         cutoff: float,
     ) -> torch.Tensor:
-        ene = torch.zeros((), dtype=coords.dtype, device=coords.device)
-        ene = ene + self.bond(coords, bonds, b0, kb)
-        ene = ene + self.angle(coords, angles, th0, kth)
-        ene = ene + self.nonbonded(
-            coords,
-            pairs,
-            box,
-            sigma,
-            epsilon,
-            charges,
-            coul_constant,
-            cutoff,
-            True,
-        )
-        # Long-range Coulomb via Ewald (energy only, no fields).
-        ene = ene + self.ewald(coords, box, charges, None, None)
+
+        if self.use_cuda_streams:
+            main = torch.cuda.current_stream()
+            self.s1.wait_stream(main)
+            self.s2.wait_stream(main)
+            self.s3.wait_stream(main)
+            self.s4.wait_stream(main)
+            with torch.cuda.stream(self.s1):
+                ene_bond = self.bond(coords, bonds, b0, kb)
+            with torch.cuda.stream(self.s2):
+                ene_angle = self.angle(coords, angles, th0, kth)
+            with torch.cuda.stream(self.s3):
+                ene_nb = self.nonbonded(
+                    coords,
+                    pairs,
+                    box,
+                    sigma,
+                    epsilon,
+                    charges,
+                    coul_constant,
+                    cutoff,
+                    True,
+                )
+            with torch.cuda.stream(self.s4):
+                ene_lr = self.long_range(coords, box, charges, None, None)
+
+            main.wait_stream(self.s1)
+            main.wait_stream(self.s2)
+            main.wait_stream(self.s3)
+            main.wait_stream(self.s4)
+        else:
+            ene_bond = self.bond(coords, bonds, b0, kb)
+            ene_angle = self.angle(coords, angles, th0, kth)
+            ene_nb = self.nonbonded(
+                    coords,
+                    pairs,
+                    box,
+                    sigma,
+                    epsilon,
+                    charges,
+                    coul_constant,
+                    cutoff,
+                    True,
+            )
+            ene_lr = self.long_range(coords, box, charges, None, None)
+        ene = ene_bond + ene_angle + ene_nb + ene_lr
         return ene
 
 
@@ -144,6 +194,7 @@ def run_torchff_benchmark_single(
     device: str,
     dtype: torch.dtype,
     repeat: int,
+    long_range: str,
 ) -> Dict[str, Any]:
     """Run a TorchFF fixed-charge benchmark for a given system size."""
     wd = get_water_data(
@@ -165,21 +216,27 @@ def run_torchff_benchmark_single(
     pairs = _build_torchff_neighbor_list(coords, box, cutoff_nm)
 
     alpha, kmax = _estimate_ewald_params(box)
-    bond, angle, nonbonded, ewald = _build_torchff_models(
+    bond, angle, nonbonded, lr_module = _build_torchff_models(
         alpha=alpha,
         kmax=kmax,
         device=device,
         dtype=dtype,
+        long_range=long_range,
     )
 
-    model = TorchFFFixedChargeModel(
+    model =TorchFFFixedChargeModel(
         bond=bond,
         angle=angle,
         nonbonded=nonbonded,
-        ewald=ewald,
+        long_range=lr_module,
     ).to(device=device, dtype=dtype)
 
     coulomb_constant = 138.935456
+
+    desc = (
+        f"torchff_fixed_charge_{long_range} "
+        f"(waters={num_waters}, alpha={alpha:.6f}, kmax={kmax})"
+    )
 
     perf = perf_op(
         model,
@@ -197,22 +254,25 @@ def run_torchff_benchmark_single(
         charges,
         coulomb_constant,
         cutoff_nm,
-        desc=f"torchff_fixed_charge (waters={num_waters}, alpha={alpha:.6f}, kmax={kmax})",
+        desc=desc,
         warmup=10,
         repeat=repeat,
         run_backward=True,
-        use_cuda_graph=True
+        use_cuda_graph=True,
+        explicit_sync=False
     )
 
     mean_ms = float(np.mean(perf))
     std_ms = float(np.std(perf))
+    engine_name = "torchff_pme" if long_range == "pme" else "torchff"
+
     print(
-        f"TorchFF N={num_waters}: {mean_ms:.4f} ± {std_ms:.4f} ms/step, "
-        f"alpha={alpha:.6f}, kmax={kmax}"
+        f"TorchFF ({long_range}) N={num_waters}: "
+        f"{mean_ms:.4f} ± {std_ms:.4f} ms/step, alpha={alpha:.6f}, kmax={kmax}"
     )
 
     return {
-        "engine": "torchff",
+        "engine": engine_name,
         "num_waters": num_waters,
         "num_atoms": int(coords.shape[0]),
         "mean_ms_per_step": mean_ms,
@@ -226,30 +286,40 @@ def run_openmm_benchmark_single(
     num_waters: int,
     steps: int,
     platform: str | None,
+    long_range: str,
+    alpha: float | None = None,
+    kmax: int | None = None,
 ) -> Dict[str, Any]:
     """Run an OpenMM fixed-charge benchmark for a given system size."""
     tests_dir = os.path.join(os.path.dirname(__file__), "..", "tests", "water")
     pdb_path = os.path.join(tests_dir, f"water_{num_waters}.pdb")
-    ms_per_step, alpha, kmax = run_openmm_water_md(
+    use_pme = long_range == "pme"
+
+    ms_per_step, alpha_out, kmax_out = run_openmm_water_md(
         pdb=pdb_path,
         steps=steps,
         platform=platform,
         temperature=300.0,
-        use_pme=False
+        use_pme=use_pme,
+        alpha=alpha if use_pme and alpha is not None and kmax is not None else None,
+        kmax=kmax if use_pme and alpha is not None and kmax is not None else None,
     )
     num_atoms = num_waters * 3
+
+    engine_name = "openmm_pme" if use_pme else "openmm"
+
     print(
-        f"OpenMM  N={num_waters}: {ms_per_step:.4f} ms/step, "
-        f"alpha={alpha}, kmax={kmax}"
+        f"OpenMM ({'pme' if use_pme else 'ewald'}) N={num_waters}: "
+        f"{ms_per_step:.4f} ms/step, alpha={alpha_out}, kmax={kmax_out}"
     )
     return {
-        "engine": "openmm",
+        "engine": engine_name,
         "num_waters": num_waters,
         "num_atoms": num_atoms,
         "mean_ms_per_step": float(ms_per_step),
         "std_ms_per_step": float("nan"),
-        "alpha": str(alpha),
-        "kmax": int(kmax),
+        "alpha": str(alpha_out),
+        "kmax": int(kmax_out),
     }
 
 
@@ -326,13 +396,13 @@ def main() -> None:
     parser.add_argument(
         "--torchff-repeat",
         type=int,
-        default=200,
+        default=1000,
         help="Number of TorchFF forward passes used for timing.",
     )
     parser.add_argument(
         "--openmm-steps",
         type=int,
-        default=10000,
+        default=5000,
         help="Number of MD steps for each OpenMM benchmark run.",
     )
     parser.add_argument(
@@ -344,7 +414,7 @@ def main() -> None:
     parser.add_argument(
         "--dtype",
         type=str,
-        default="float32",
+        default="float64",
         choices=["float32", "float64"],
         help="Torch dtype to use for TorchFF benchmarks.",
     )
@@ -354,11 +424,39 @@ def main() -> None:
         default=None,
         help="Optional OpenMM platform name (e.g. CUDA, CPU).",
     )
+    parser.add_argument(
+        "--long-range",
+        type=str,
+        default="ewald",
+        choices=["ewald", "pme"],
+        help="Long-range electrostatics method for both TorchFF and OpenMM.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Profile mode: run only TorchFF benchmark once (no OpenMM, no CSV/plot). "
+            "Run the script under 'nsys profile' to capture GPU timeline."
+        ),
+    )
+    parser.add_argument(
+        "--profile-waters",
+        type=int,
+        default=1000,
+        help="Number of waters to use when --profile is set (default: 1000).",
+    )
+    parser.add_argument(
+        "--profile-repeat",
+        type=int,
+        default=100,
+        help="Number of repeats in profile mode (default: 100). Keep moderate for readable traces.",
+    )
 
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for TorchFF benchmarks.")
+    # Require CUDA only when explicitly using a CUDA device.
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required when using a CUDA Torch device.")
 
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
 
@@ -370,6 +468,22 @@ def main() -> None:
 
     cutoff_nm = 0.8
 
+    if args.profile:
+        print(
+            "Profile mode: running TorchFF only (perf_op section). "
+            "Ensure this process is run under 'nsys profile' to capture GPU timeline."
+        )
+        run_torchff_benchmark_single(
+            num_waters=args.profile_waters,
+            cutoff_nm=cutoff_nm,
+            device=args.device,
+            dtype=dtype,
+            repeat=args.profile_repeat,
+            long_range=args.long_range,
+        )
+        print("Profile run finished. Check the nsys report (e.g. .nsys-rep) for GPU timeline.")
+        return
+
     all_results: List[Dict[str, Any]] = []
     for n_w in args.waters:
         print(f"Running TorchFF benchmark for N={n_w} waters")
@@ -379,20 +493,28 @@ def main() -> None:
             device=args.device,
             dtype=dtype,
             repeat=args.torchff_repeat,
+            long_range=args.long_range,
         )
         all_results.append(torchff_res)
 
         print(f"Running OpenMM benchmark for N={n_w} waters")
+        alpha_in = torchff_res["alpha"] if args.long_range == "pme" else None
+        kmax_in = torchff_res["kmax"] if args.long_range == "pme" else None
         openmm_res = run_openmm_benchmark_single(
             num_waters=n_w,
             steps=args.openmm_steps,
             platform=args.openmm_platform,
+            long_range=args.long_range,
+            alpha=alpha_in,
+            kmax=kmax_in,
         )
         all_results.append(openmm_res)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(script_dir, "fixed_charge_benchmark.csv")
-    pdf_path = os.path.join(script_dir, "fixed_charge_benchmark.pdf")
+    stem = f"fixed_charge_benchmark_{args.long_range}_{args.dtype}"
+
+    csv_path = os.path.join(script_dir, f"{stem}.csv")
+    pdf_path = os.path.join(script_dir, f"{stem}.pdf")
 
     write_results_to_csv(all_results, csv_path)
     plot_results(all_results, pdf_path)

@@ -122,6 +122,44 @@ def computeDampFactorsErfc(dr: torch.Tensor, b: float, rank: int):
     return torch.stack([erfc_u + prefactor * p * exp2_u for p in [p1, p3, p5, p7, p9]], dim=0)
 
 
+@torch._dynamo.disable
+def _compute_multipolar_energy_and_fields_from_atom_pairs(
+    coords: torch.Tensor,
+    box: torch.Tensor,
+    pairs: torch.Tensor,
+    pairs_excl: torch.Tensor | None,
+    q: torch.Tensor,
+    p: torch.Tensor | None,
+    t: torch.Tensor | None,
+    cutoff: float,
+    ewald_alpha: float,
+    prefactor: float,
+):
+    return torch.ops.torchff.compute_multipolar_energy_and_fields_from_atom_pairs(
+        coords, box, pairs, pairs_excl, q, p, t,
+        cutoff, ewald_alpha, prefactor,
+    )
+
+
+@torch._dynamo.disable
+def _compute_multipolar_energy_from_atom_pairs(
+    coords: torch.Tensor,
+    box: torch.Tensor,
+    pairs: torch.Tensor,
+    pairs_excl: torch.Tensor | None,
+    q: torch.Tensor,
+    p: torch.Tensor | None,
+    t: torch.Tensor | None,
+    cutoff: float,
+    ewald_alpha: float,
+    prefactor: float,
+):
+    return torch.ops.torchff.compute_multipolar_energy_from_atom_pairs(
+        coords, box, pairs, pairs_excl, q, p, t,
+        cutoff, ewald_alpha, prefactor,
+    )
+
+
 class MultipolePacker(nn.Module):
     """
     Convert monopole, dipole, and quadrupole to (N, 10) polytensor with
@@ -302,12 +340,12 @@ class MultipolarInteraction(nn.Module):
         # pairs_excl is only effective when ewald_alpha > 0; when None or ewald_alpha <= 0
         # the kernel receives nullptr and npairs_excl=0 (handled in C++/CUDA).
         if self.return_fields:
-            energy, epot, efield = torch.ops.torchff.compute_multipolar_energy_and_fields_from_atom_pairs(
+            energy, epot, efield = _compute_multipolar_energy_and_fields_from_atom_pairs(
                 coords, box, pairs, pairs_excl, q, p, t,
                 self.cutoff, self.ewald_alpha, self.prefactor,
             )
             return energy, epot, efield
-        return torch.ops.torchff.compute_multipolar_energy_from_atom_pairs(
+        return _compute_multipolar_energy_from_atom_pairs(
             coords, box, pairs, pairs_excl, q, p, t,
             self.cutoff, self.ewald_alpha, self.prefactor,
         )

@@ -91,6 +91,10 @@ __global__ void slater_cuda_kernel(
         int64_t offset_i = 3 * i;
         int64_t offset_j = 3 * j;
 
+        if (i < 0 || j < 0) {
+            continue;
+        }
+
         scalar_t rij_vec[3];
         scalar_t tmp[3];
         diff_vec3(&coords[offset_i], &coords[offset_j], tmp);
