@@ -7,6 +7,8 @@ A PyTorch library for implementing force field terms with custom CUDA kernels.
    :maxdepth: 2
    :caption: Contents:
 
+   installation
+   examples
    api/index
    developer
 
