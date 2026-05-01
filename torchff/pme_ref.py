@@ -144,11 +144,13 @@ def setup_kpts(box, kpts_int):
     return kpts
 def spread_Q(N, positions, box, Q_dict, n_mesh, rank):
     """
-    Cartesian Spread Kernel (Updated for 6-component Quadrupoles)
+    Cartesian Spread Kernel (Updated for 6-component Quadrupoles).
+
     Uses Q_dict containing:
-      - 'q': (N, 1)
-      - 'p': (N, 3)
-      - 'theta_vec': (N, 6) -> [xx, xy, xz, yy, yz, zz]
+
+    - 'q': (N, 1)
+    - 'p': (N, 3)
+    - 'theta_vec': (N, 6) -> [xx, xy, xz, yy, yz, zz]
     """
     shifts = make_stencil(order=6)
     Nj_Aji_star = get_recip_vectors(N, box)
