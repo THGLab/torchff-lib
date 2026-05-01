@@ -23,7 +23,6 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.intersphinx",
     "sphinx.ext.todo",
-    "myst_parser",
 ]
 
 # Mock CUDA extension modules so autodoc works without compiling them
@@ -70,12 +69,6 @@ napoleon_use_ivar = False
 napoleon_use_param = True
 napoleon_use_rtype = True
 
-# MyST parser settings (for including Markdown files)
-source_suffix = {
-    ".rst": "restructuredtext",
-    ".md": "markdown",
-}
-
 # Templates
 templates_path = ["_templates"]
 
@@ -84,24 +77,16 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
 
 # -- HTML output options -----------------------------------------------------
 
-html_theme = "sphinx_material"
+html_theme = "sphinx_book_theme"
 
 html_theme_options = {
-    "nav_title": "torchff",
-    "base_url": "https://Ericwang6.github.io/torchff-lib",
-    "color_primary": "blue",
-    "color_accent": "light-blue",
-    "repo_url": "https://github.com/Ericwang6/torchff-lib/",
-    "repo_name": "torchff-lib",
-    "globaltoc_depth": 3,
-    "globaltoc_collapse": False,
-    "globaltoc_includehidden": False,
+    "repository_url": "https://github.com/THGLab/torchff-lib",
+    "use_repository_button": True,
+    "use_issues_button": True,
+    "home_page_in_toc": True,
 }
 
-html_sidebars = {
-    "**": ["logo-text.html", "globaltoc.html", "localtoc.html", "searchbox.html"]
-}
-
+html_title = "torchff"
 html_static_path = ["_static"]
 
 # -- Intersphinx mapping -----------------------------------------------------
