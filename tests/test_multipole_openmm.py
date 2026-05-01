@@ -17,7 +17,7 @@ import openmm.unit as unit
 
 import torchff
 from torchff.multipoles import MultipolarInteraction
-from torchff.multipolar.rotation import (
+from torchff.multipoles import (
     _compute_rotation_matrices_python,
     rotateDipoles,
     rotateQuadrupoles,

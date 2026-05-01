@@ -13,7 +13,7 @@ import openmm as mm
 import openmm.app as app
 import openmm.unit as unit
 
-from torchff.multipolar.rotation import MultipolarRotation
+from torchff.multipoles import MultipolarRotation
 
 ROOT = Path(__file__).resolve().parent
 

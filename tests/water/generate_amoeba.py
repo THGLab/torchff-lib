@@ -14,7 +14,7 @@ import openmm.unit as unit
 import sys
 test_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(test_dir, '../../'))
-from torchff.multipolar.rotation import (
+from torchff.multipoles import (
     _compute_rotation_matrices_python,
     rotateDipoles,
     rotateQuadrupoles,

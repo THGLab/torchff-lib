@@ -22,7 +22,7 @@ from torchff.multipoles import MultipolarInteraction, computeDampFactorsErfc, co
 from torchff.nblist import NeighborList
 from torchff.pme import PME
 from torchff.ewald import Ewald
-from torchff.multipolar.rotation import MultipolarRotation
+from torchff.multipoles import MultipolarRotation
 from torchff.vdw import Vdw
 
 COULOMB_PREFACTOR_KJMOL = 138.935456
